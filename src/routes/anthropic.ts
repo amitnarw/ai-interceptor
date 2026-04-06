@@ -5,34 +5,37 @@ import { config } from '../config/index.js';
 
 const router = Router();
 
-const MINIMAX_OPENAI_URL = 'https://api.minimax.io/v1/chat/completions';
+const MINIMAX_ANTHROPIC_URL = 'https://api.minimax.io/anthropic/v1/messages';
 
-interface OpenAIRequest {
+interface AnthropicRequest {
   model?: string;
   messages?: Array<{ role: string; content: string | Array<unknown> }>;
   stream?: boolean;
   max_tokens?: number;
   temperature?: number;
   top_p?: number;
-  frequency_penalty?: number;
-  presence_penalty?: number;
-  stop?: string | string[];
-  tools?: Array<{ type: string; function: { name: string; description?: string; parameters?: unknown } }>;
-  tool_choice?: string | { type: string; function: { name: string } };
+  system?: string | Array<{ type: string; text: string }>;
+  tools?: Array<{
+    name: string;
+    description?: string;
+    input_schema: unknown;
+  }>;
   [key: string]: unknown;
 }
 
-async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
-  const requestBody: OpenAIRequest = req.body;
+async function handleAnthropicRequest(req: Request, res: Response): Promise<void> {
+  const requestBody: AnthropicRequest = req.body;
   const stream = requestBody.stream ?? false;
 
   try {
     const response = await axios({
       method: 'POST',
-      url: MINIMAX_OPENAI_URL,
+      url: MINIMAX_ANTHROPIC_URL,
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.minimaxApiKey}`,
+        'x-api-key': config.minimaxApiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
       },
       data: requestBody,
       responseType: stream ? 'stream' : 'json',
@@ -49,7 +52,7 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
       streamData.pipe(res);
 
       streamData.on('error', (error: Error) => {
-        console.error(`[OpenAI] Stream error: ${error.message}`);
+        console.error(`[Anthropic] Stream error: ${error.message}`);
         if (!res.headersSent) {
           res.status(500).json({ error: { message: 'Stream error' } });
         } else {
@@ -58,7 +61,7 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
       });
 
       res.on('error', (error: Error) => {
-        console.error(`[OpenAI] Response error: ${error.message}`);
+        console.error(`[Anthropic] Response error: ${error.message}`);
         streamData.destroy();
       });
     } else {
@@ -67,7 +70,7 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
   } catch (error) {
     if (axios.isAxiosError(error)) {
       const axiosError = error as AxiosError;
-      console.error(`[OpenAI] API error: ${axiosError.message}`);
+      console.error(`[Anthropic] API error: ${axiosError.message}`);
 
       if (res.headersSent) {
         return;
@@ -86,13 +89,13 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
       } else {
         res.status(502).json({
           error: {
-            message: 'Failed to reach MiniMax API',
+            message: 'Failed to reach MiniMax Anthropic API',
             details: axiosError.message,
           },
         });
       }
     } else {
-      console.error(`[OpenAI] Unexpected error: ${error}`);
+      console.error(`[Anthropic] Unexpected error: ${error}`);
       if (!res.headersSent) {
         res.status(500).json({ error: { message: 'Internal server error' } });
       }
@@ -100,6 +103,6 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
   }
 }
 
-router.post('/v1/chat/completions', handleOpenAIRequest);
+router.post('/v1/messages', handleAnthropicRequest);
 
 export default router;
