@@ -1,6 +1,7 @@
 import { telegramBot } from './bot.js';
 import { modeManager } from '../config/mode.js';
 import { config } from '../config/index.js';
+import { approvalService } from '../services/approvalService.js';
 
 const LAST_TOOL_CALLS_MAX = 5;
 
@@ -84,6 +85,10 @@ export async function handleCommand(
       await telegramBot.sendMessage(chatId, '🗑️ Cleared recent tool call history.');
       break;
 
+    case '/callback':
+      await handleCallback(parts, chatId);
+      break;
+
     default:
       if (!command?.startsWith('/')) {
         await telegramBot.sendMessage(
@@ -103,7 +108,7 @@ This bot controls your local AI proxy.
 
 *Commands:*
 • /away - Enable approval mode
-• /desk - Disable approval mode  
+• /desk - Disable approval mode
 • /status - Current status
 • /clear - Clear tool history
 
@@ -111,4 +116,43 @@ _Proxy runs on port ${config.proxyPort}_
 `;
 
   await telegramBot.sendMessage(chatId, message);
+}
+
+async function handleCallback(parts: string[], chatId: number): Promise<void> {
+  if (parts.length < 2) {
+    await telegramBot.sendMessage(chatId, 'Invalid callback data.');
+    return;
+  }
+
+  const callbackData = parts[1];
+  const callbackParts = callbackData.split(':');
+
+  if (callbackParts.length < 2) {
+    await telegramBot.sendMessage(chatId, 'Invalid callback format.');
+    return;
+  }
+
+  const action = callbackParts[0];
+  const requestId = callbackParts.slice(1).join(':');
+
+  switch (action) {
+    case 'approve':
+      await approvalService.handleApproval(requestId, 'approve');
+      await telegramBot.sendMessage(chatId, `✅ Tool call *approved*.`);
+      break;
+
+    case 'reject':
+      await approvalService.handleApproval(requestId, 'reject');
+      await telegramBot.sendMessage(chatId, `❌ Tool call *rejected*.`);
+      break;
+
+    case 'custom':
+      // handleApproval('custom') triggers requestCustomInput which sends the prompt
+      await approvalService.handleApproval(requestId, 'custom');
+      // User will receive the modification prompt from requestCustomInput
+      break;
+
+    default:
+      await telegramBot.sendMessage(chatId, `Unknown action: ${action}`);
+  }
 }

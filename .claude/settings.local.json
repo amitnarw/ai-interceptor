@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npm install:*)",
+      "Bash(curl -s http://localhost:4000/health)",
+      "Bash(curl -s -X POST http://localhost:4000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":false}')",
+      "Bash(pkill -f \"tsx watch\")",
+      "Bash(node --loader tsx --no-warnings -e ':*)",
+      "Bash(npx tsx -e ':*)",
+      "Bash(npx tsx --tsconfig tsconfig.json -e ':*)",
+      "Bash(npx tsx:*)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 40576)",
+      "Bash(taskkill //F //PID 27400)",
+      "Bash(taskkill //F //PID 41128)",
+      "Bash(ls -la *.md)",
+      "Bash(npm test:*)",
+      "Bash(node dist/server.js)",
+      "Bash(curl -s -X POST http://localhost:4000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
+      "Bash(pkill -f \"node dist/server.js\")",
+      "Bash(taskkill //F //IM node.exe)"
+    ]
+  }
+}
