@@ -10,7 +10,7 @@ import {
   startStatus,
   addStatusEvent,
   completeStatus,
-  appendSseText,
+  getStatusState,
 } from '../services/liveStatus.js';
 
 const router = Router();
@@ -189,14 +189,17 @@ async function handleStreamingWithApproval(
     }
   }
 
-  await forwardToMiniMax(req, res, requestBody, true);
+  // Preserve the existing messageId so we don't create a new pinned message
+  const existingMsgId = getStatusState(chatId)?.messageId ?? null;
+  await forwardToMiniMax(req, res, requestBody, true, existingMsgId);
 }
 
 async function forwardToMiniMax(
   req: Request,
   res: Response,
   requestBody: OpenAIRequest,
-  trackStatus: boolean = false
+  trackStatus: boolean = false,
+  existingMessageId?: number | null
 ): Promise<void> {
   const stream = requestBody.stream ?? false;
   const chatId = parseInt(config.telegramChatId, 10);
@@ -233,7 +236,7 @@ async function forwardToMiniMax(
     res.setHeader('X-Request-Id', req.headers['x-request-id'] as string || '');
 
     if (trackStatus) {
-      startStatus(chatId);
+      startStatus(chatId, existingMessageId);
     }
 
     const streamData = response.data as Readable;
@@ -244,14 +247,11 @@ async function forwardToMiniMax(
       if (trackStatus && !streamEnded) {
         const { events, cleanChunk } = sseParser.parse(chunk);
 
-        // Append streaming text to Telegram message
-        if (cleanChunk && cleanChunk.trim()) {
-          appendSseText(chatId, cleanChunk);
-        }
-
         for (const event of events) {
           if (event.type === 'text' && event.data) {
             addStatusEvent(chatId, { type: 'text', detail: event.data });
+          } else if (event.type === 'content_block' && event.contentBlockType === 'thinking') {
+            addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'tool_complete' && event.toolEvent) {
             const toolName = event.toolEvent.name;
             const path = SSEParser.extractPathFromArguments(
@@ -272,7 +272,7 @@ async function forwardToMiniMax(
           }
         }
 
-        res.write(cleanChunk || chunk.toString());
+        res.write(cleanChunk);
       } else {
         res.write(chunk);
       }

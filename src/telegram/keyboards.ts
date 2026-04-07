@@ -1,5 +1,6 @@
 export interface ApprovalKeyboard {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  input_field_placeholder?: string;
 }
 
 export function buildApprovalKeyboard(requestId: string): ApprovalKeyboard {
@@ -15,8 +16,8 @@ export function buildApprovalKeyboard(requestId: string): ApprovalKeyboard {
 }
 
 export function escapeMarkdown(text: string): string {
-  const specialChars = /([_*[`~>#+\-=|{}.!\\])/g;
-  return text.replace(specialChars, '\\$1');
+  const specialChars = /([_*[`~>#+\-=|{}.!\\()\[\]])/g;
+  return text.replace(specialChars, '\\$&');
 }
 
 export function formatToolApprovalMessage(
@@ -56,6 +57,7 @@ export function buildCommandKeyboard(): ApprovalKeyboard {
         { text: 'Clear', callback_data: 'cmd:clear' },
       ],
     ],
+    input_field_placeholder: 'Use buttons below to interact',
   };
 }
 
@@ -76,6 +78,7 @@ export function buildApprovalPlusCommandKeyboard(requestId: string): ApprovalKey
         { text: 'Clear', callback_data: 'cmd:clear' },
       ],
     ],
+    input_field_placeholder: 'Use buttons below to interact',
   };
 }
 

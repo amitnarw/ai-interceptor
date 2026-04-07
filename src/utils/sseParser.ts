@@ -39,6 +39,7 @@ export class SSEParser {
           const data = lines[i].slice(6).trim();
           const parsedEvent = this.parseEventData(eventType, data);
           if (parsedEvent) events.push(parsedEvent);
+          // Don't add SSE metadata lines to cleanChunk
         } else if (i < lines.length && lines[i].trim() === '') {
           i++;
           continue;
@@ -62,7 +63,10 @@ export class SSEParser {
       }
     }
 
-    const cleanChunk = chunk.toString()
+    // cleanChunk forwards raw SSE to client unchanged - only strip [DONE] and ping
+    // which should not be forwarded to the AI client
+    const raw = chunk.toString();
+    const cleanChunk = raw
       .replace(/data: \[DONE\]\r?\n\r?\n?/g, '')
       .replace(/event: ping\r?\n\r?\n?/g, '');
 
@@ -76,6 +80,12 @@ export class SSEParser {
 
     try {
       const data = JSON.parse(rawData);
+
+      // Detect actual event type from data.type for OpenAI-style chunks
+      // where event type is 'message' but data.type tells the real type
+      if (eventType === 'message' && data.type) {
+        eventType = data.type;
+      }
 
       if (eventType === 'content_block_start' || eventType === 'message_start') {
         if (data.type === 'content_block_start' && data.content_block?.type === 'thinking') {

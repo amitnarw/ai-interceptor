@@ -186,9 +186,11 @@ async function processUpdate(update: TelegramUpdate): Promise<void> {
       }
     }
 
-    // Handle messages (custom input replies via force_reply)
+    // Handle messages (text commands and force_reply responses)
     if (update.message) {
-      const { chat, text, reply_to_message_id } = update.message;
+      const { chat, text, reply_to_message_id, message_id } = update.message;
+
+      // Handle force_reply responses (custom input)
       if (text && reply_to_message_id !== undefined) {
         const forceReplyMsgId = customInputMessageId.get(chat.id);
         if (forceReplyMsgId && reply_to_message_id === forceReplyMsgId) {
@@ -201,6 +203,13 @@ async function processUpdate(update: TelegramUpdate): Promise<void> {
             return;
           }
         }
+      }
+
+      // Handle text commands (e.g. /start, /status, etc.)
+      if (text && text.startsWith('/')) {
+        console.log(`[Telegram] Command message: ${text}`);
+        await handleCommand(text, chat.id, message_id);
+        return;
       }
     }
   } catch (error) {
@@ -244,10 +253,12 @@ async function sendMessageWithId(
   text: string,
   replyMarkup?: ApprovalKeyboard
 ): Promise<TelegramMessage | null> {
+  console.log(`[Telegram] sendMessageWithId called for chat ${chatId}, text length: ${text.length}`);
   try {
     messageQueue.push({ chatId, text, replyMarkup });
     await processQueue();
     const sent = lastSentMessage;
+    console.log(`[Telegram] sendMessageWithId got lastSentMessage:`, sent);
     lastSentMessage = null;
     return sent;
   } catch (error) {
@@ -361,6 +372,7 @@ async function setMyCommands(): Promise<void> {
 
 async function pinChatMessage(chatId: number, messageId: number): Promise<void> {
   const url = `https://api.telegram.org/bot${token}/pinChatMessage`;
+  console.log(`[Telegram] Attempting to pin message ${messageId} for chat ${chatId}`);
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -371,6 +383,7 @@ async function pinChatMessage(chatId: number, messageId: number): Promise<void> 
     if (!data.ok) {
       console.warn(`[Telegram] pinChatMessage failed: ${data.description}`);
     } else {
+      console.log(`[Telegram] Successfully pinned message ${messageId}`);
       pinnedMessageId.set(chatId, messageId);
     }
   } catch (error) {
@@ -454,6 +467,7 @@ async function doSendMessage(
   replyMarkup?: ApprovalKeyboard
 ): Promise<TelegramMessage | null> {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  console.log(`[Telegram] doSendMessage sending to chat ${chatId}`);
   const bodyObj: Record<string, unknown> = {
     chat_id: chatId,
     text,
@@ -475,9 +489,11 @@ async function doSendMessage(
 
     if (!data.ok) {
       handleTelegramAPIError(data.description);
+      console.warn(`[Telegram] doSendMessage failed: ${data.description}`);
       return null;
     }
 
+    console.log(`[Telegram] doSendMessage succeeded, message_id: ${data.result?.message_id}`);
     return data.result ?? null;
   } catch (error) {
     console.error('[Telegram] Send error:', error);
@@ -506,6 +522,11 @@ function clearCustomInputState(chatId: number): void {
 
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
+export function escapeMarkdown(text: string): string {
+  const specialChars = /([_*[`~>#+\-=|{}.!\\()\[\]])/g;
+  return text.replace(specialChars, '\\$&');
+}
+
 export const telegramBot = {
   start: startBot,
   stop: stopBot,
@@ -519,4 +540,5 @@ export const telegramBot = {
   sendMessageForceReply,
   setCustomInputMessageId,
   clearCustomInputState,
+  escapeMarkdown,
 };

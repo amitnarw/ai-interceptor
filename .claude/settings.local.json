@@ -21,7 +21,21 @@
       "Bash(pkill -f \"node dist/server.js\")",
       "Bash(taskkill //F //IM node.exe)",
       "Bash(pnpm vitest:*)",
-      "Bash(pnpm tsc:*)"
+      "Bash(pnpm tsc:*)",
+      "Bash(pnpm build:*)",
+      "WebSearch",
+      "Bash(gh search:*)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "Bash(node -e \"import\\('dotenv'\\).then\\(d => { d.config\\(\\); console.log\\('TELEGRAM_BOT_TOKEN:', process.env.TELEGRAM_BOT_TOKEN\\); console.log\\('TELEGRAM_CHAT_ID:', process.env.TELEGRAM_CHAT_ID\\); }\\)\")",
+      "Bash(curl -s \"https://api.telegram.org/bot8615412899:AAHy4_2f8zYiSYeVbQtORsDDwuePga_iN3w/getMe\")",
+      "Bash(curl -s \"https://api.telegram.org/bot8615412899:AAHy4_2f8zYiSYeVbQtORsDDwuePga_iN3w/sendMessage\" -X POST -H \"Content-Type: application/json\" -d '{\"chat_id\":799722062,\"text\":\"*Test* from curl\",\"parse_mode\":\"Markdown\"}')",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.github.com)",
+      "WebFetch(domain:www.postman.com)",
+      "WebFetch(domain:core.telegram.org)",
+      "WebFetch(domain:docs.bullmq.io)",
+      "WebFetch(domain:www.axiosup.com)"
     ]
   }
 }

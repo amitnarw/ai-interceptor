@@ -1,6 +1,12 @@
 import { telegramBot } from '../telegram/bot.js';
 import { buildCommandKeyboard, buildApprovalPlusCommandKeyboard } from '../telegram/keyboards.js';
 
+// Escape function to prevent Markdown parsing errors in Telegram
+export function escapeMarkdown(text: string): string {
+  const specialChars = /([_*[`~>#+\-=|{}.!\\()\[\]])/g;
+  return text.replace(specialChars, '\\$&');
+}
+
 export type StatusPhase = 'idle' | 'active' | 'awaiting_approval';
 
 export type EventType =
@@ -47,7 +53,6 @@ interface ChatState {
   lastSentText: string;
   isFlushing: boolean;
   flushId: number;
-  // Accumulated SSE streaming text (raw text deltas from the AI)
   sseText: string;
 }
 
@@ -57,7 +62,7 @@ const MIN_EDIT_INTERVAL_MS = 1000;
 const MAX_EVENTS = 10;
 const MAX_TEXT_LENGTH = 200;
 const MAX_PREVIEW_LENGTH = 300;
-const MAX_SSE_DISPLAY_LENGTH = 3000; // Telegram message limit buffer
+const MAX_SSE_DISPLAY_LENGTH = 3000;
 
 function getOrCreateChatState(chatId: number): ChatState {
   let chatState = chatStates.get(chatId);
@@ -125,13 +130,13 @@ function buildStatusText(status: LiveStatusState, sseText: string): string {
     return lines.join('\n');
   }
 
-  // Show SSE streaming content first
+  // Show SSE streaming content first (escape special Markdown chars)
   if (sseText.length > 0) {
     let displaySse = sseText;
     if (displaySse.length > MAX_SSE_DISPLAY_LENGTH) {
       displaySse = '...' + displaySse.slice(-MAX_SSE_DISPLAY_LENGTH);
     }
-    lines.push(displaySse);
+    lines.push(escapeMarkdown(displaySse));
     lines.push('');
   }
 
@@ -146,13 +151,13 @@ function buildStatusText(status: LiveStatusState, sseText: string): string {
 
   // Pending approval info
   if (status.pendingApproval) {
-    lines.push(`Tool: ${status.pendingApproval.toolName}`);
+    lines.push(`Tool: ${escapeMarkdown(status.pendingApproval.toolName)}`);
     if (status.pendingApproval.filePath) {
-      lines.push(`File: ${status.pendingApproval.filePath}`);
+      lines.push(`File: ${escapeMarkdown(status.pendingApproval.filePath)}`);
     }
     if (status.pendingApproval.preview) {
       const preview = status.pendingApproval.preview.substring(0, MAX_PREVIEW_LENGTH);
-      lines.push(`Preview: ${preview}`);
+      lines.push(`Preview: ${escapeMarkdown(preview)}`);
     }
   }
 
@@ -166,18 +171,18 @@ function buildStatusText(status: LiveStatusState, sseText: string): string {
           eventLine = 'Thinking...';
           break;
         case 'text':
-          eventLine = `Text: ${(event.detail ?? '').substring(0, MAX_TEXT_LENGTH)}`;
+          eventLine = `Text: ${escapeMarkdown((event.detail ?? '').substring(0, MAX_TEXT_LENGTH))}`;
           break;
         case 'tool_start':
           eventLine = `Started: ${event.tool ?? 'unknown'}`;
-          if (event.path) eventLine += ` (${event.path})`;
+          if (event.path) eventLine += ` (${escapeMarkdown(event.path)})`;
           break;
         case 'tool_complete':
           eventLine = `Completed: ${event.tool ?? 'unknown'}`;
           break;
         case 'tool_error':
           eventLine = `Error: ${event.tool ?? 'unknown'}`;
-          if (event.detail) eventLine += ` - ${event.detail}`;
+          if (event.detail) eventLine += ` - ${escapeMarkdown(event.detail)}`;
           break;
         case 'approval_required':
           eventLine = `Approval needed: ${event.tool ?? 'unknown'}`;
@@ -221,7 +226,6 @@ async function flushStatusUpdate(chatState: ChatState): Promise<void> {
       return;
     }
 
-    // Choose keyboard based on state
     let keyboard;
     if (status.phase === 'awaiting_approval' && status.pendingApproval) {
       keyboard = buildApprovalPlusCommandKeyboard(status.pendingApproval.requestId);
@@ -230,14 +234,12 @@ async function flushStatusUpdate(chatState: ChatState): Promise<void> {
     }
 
     if (status.messageId === null) {
-      // Send initial message and pin it
       const sent = await telegramBot.sendMessageWithId(status.chatId, text, keyboard);
       if (sent && sent.message_id) {
         status.messageId = sent.message_id;
         await telegramBot.pinChatMessage(status.chatId, sent.message_id);
       }
     } else {
-      // Edit existing pinned message with command keyboard
       await telegramBot.editMessage(status.chatId, status.messageId, text, keyboard);
     }
 
@@ -256,21 +258,17 @@ function scheduleStatusUpdate(chatId: number): void {
     return;
   }
 
+  // If there's already a pending flush, don't schedule another
+  // The existing flush will pick up any new state
   if (chatState.queueTimeout !== null) {
     return;
   }
 
   const timeSinceLast = Date.now() - chatState.lastSentTime;
   const delay = Math.max(0, MIN_EDIT_INTERVAL_MS - timeSinceLast);
-  const currentFlushId = chatState.flushId;
 
   chatState.queueTimeout = setTimeout(async () => {
     chatState.queueTimeout = null;
-
-    if (chatState.flushId !== currentFlushId) {
-      console.log(`[LiveStatus] Stale timeout ignored (flushId=${currentFlushId} != ${chatState.flushId})`);
-      return;
-    }
 
     if (!chatState.status.isActive) {
       console.log(`[LiveStatus] Timeout fired but status not active`);
@@ -279,13 +277,15 @@ function scheduleStatusUpdate(chatId: number): void {
 
     await flushStatusUpdate(chatState);
 
+    // Only schedule another if there are pending events AND status is still active
+    // This prevents cascading timeouts when events keep arriving
     if (chatState.status.events.length > 0 && chatState.status.isActive) {
       scheduleStatusUpdate(chatId);
     }
   }, delay);
 }
 
-export function startStatus(chatId: number): void {
+export function startStatus(chatId: number, existingMessageId?: number | null): void {
   const chatState = getOrCreateChatState(chatId);
 
   if (chatState.queueTimeout !== null) {
@@ -296,7 +296,12 @@ export function startStatus(chatId: number): void {
   chatState.flushId++;
   chatState.status.isActive = true;
   chatState.status.phase = 'active';
-  chatState.status.messageId = null;
+  // Preserve existing messageId if provided, otherwise reset to null (new message)
+  if (existingMessageId !== undefined) {
+    chatState.status.messageId = existingMessageId;
+  } else {
+    chatState.status.messageId = null;
+  }
   chatState.status.events = [];
   chatState.lastSentText = '';
   chatState.sseText = '';
@@ -372,10 +377,9 @@ export function completeStatus(chatId: number, success: boolean): void {
 
   chatState.status.phase = 'idle';
   chatState.status.isActive = false;
-  chatState.status.messageId = null; // Reset so next startStatus sends fresh pinned message
+  chatState.status.messageId = null;
   chatState.lastSentText = '';
 
-  // Force immediate flush to show final status
   flushStatusUpdate(chatState);
 }
 
