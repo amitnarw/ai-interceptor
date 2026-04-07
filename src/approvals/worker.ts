@@ -1,11 +1,14 @@
-import { Job } from 'bullmq';
 import { getRedisClient } from '../config/redis.js';
 import { ApprovalJobData } from './queue.js';
 import { config } from '../config/index.js';
 import { FakeApprovalQueue, getFakeApprovalQueue, FakeJob } from './fakeQueue.js';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let realWorker: any = null;
+interface WorkerInterface {
+  on: (event: string, handler: (job?: unknown, err?: Error) => void) => void;
+  close: () => Promise<void>;
+}
+
+let realWorker: WorkerInterface | null = null;
 let fakeWorker: FakeApprovalQueue | null = null;
 let fakeWorkerInterval: ReturnType<typeof setInterval> | null = null;
 let onApprovalTimeoutCallback: ((job: ApprovalJobData) => void) | null = null;
@@ -26,9 +29,9 @@ export async function createApprovalWorker(
     // Verify Redis works
     await connection.ping();
 
-    realWorker = new Worker<ApprovalJobData>(
+    const worker = new Worker(
       'approval-requests',
-      async (job: Job<ApprovalJobData>) => {
+      async (job: { id: string; data: ApprovalJobData; getState: () => Promise<string>; moveToFailed: (err: Error, token?: string, keepJob?: boolean) => Promise<void> }) => {
         console.log(`[ApprovalWorker] Processing job ${job.id}`);
 
         const timeoutMs = config.autoRejectTimeoutMs;
@@ -61,28 +64,30 @@ export async function createApprovalWorker(
       }
     );
 
-    realWorker.on('completed', (job: Job<ApprovalJobData>) => {
-      console.log(`[ApprovalWorker] Job ${job.id} completed`);
+    worker.on('completed', (job: unknown) => {
+      const j = job as { id: string } | undefined;
+      console.log(`[ApprovalWorker] Job ${j?.id} completed`);
     });
 
-    realWorker.on('failed', (job: Job<ApprovalJobData> | undefined, err: Error) => {
-      console.log(`[ApprovalWorker] Job ${job?.id} failed:`, err.message);
+    worker.on('failed', (job: unknown, err: unknown) => {
+      const j = job as { id?: string } | undefined;
+      const e = err as Error | undefined;
+      console.log(`[ApprovalWorker] Job ${j?.id} failed:`, e?.message);
     });
 
-    realWorker.on('error', (err: Error) => {
-      console.error('[ApprovalWorker] Error:', err.message);
-      // If BullMQ encounters an error (e.g., Lua script issue with ioredis-mock),
-      // fall back to fake worker if not already using it
+    worker.on('error', (err: unknown) => {
+      console.error('[ApprovalWorker] Error:', (err as Error)?.message);
       if (fakeWorker === null) {
         console.log('[ApprovalWorker] BullMQ error, falling back to fake worker');
         realWorker = null;
-        realWorker = undefined; // Ensure we don't try to close it later
-        startFakeWorker(timeoutCallback!);
+        startFakeWorker(timeoutCallback);
       }
     });
 
+    realWorker = worker;
+
     console.log('[ApprovalWorker] Started with BullMQ');
-  } catch (error) {
+  } catch {
     // Fall back to fake worker
     console.log('[ApprovalWorker] Falling back to fake worker (no Redis)');
     startFakeWorker(timeoutCallback);

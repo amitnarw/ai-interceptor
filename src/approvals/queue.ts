@@ -1,4 +1,3 @@
-import { Queue } from 'bullmq';
 import { getRedisClient } from '../config/redis.js';
 import { getFakeApprovalQueue } from './fakeQueue.js';
 
@@ -15,11 +14,21 @@ export interface ApprovalJobData {
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'timeout';
 
+interface QueueInterface {
+  add: (name: string, data: ApprovalJobData) => Promise<string>;
+  getJob: (id: string) => Promise<{ data: ApprovalJobData } | null>;
+  getState: (id: string) => Promise<string>;
+  getWaiting: () => Promise<{ data: ApprovalJobData }[]>;
+  getActive: () => Promise<{ data: ApprovalJobData }[]>;
+  getDelayed: () => Promise<{ data: ApprovalJobData }[]>;
+  moveToCompleted: (data: ApprovalJobData, token?: string, keepJob?: boolean) => Promise<void>;
+  moveToFailed: (err: Error, token?: string, keepJob?: boolean) => Promise<void>;
+  close: () => Promise<void>;
+}
+
 let useFakeQueue = false;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let realQueue: Queue<ApprovalJobData> | null = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let fakeQueue: any = null;
+let realQueue: QueueInterface | null = null;
+let fakeQueue: QueueInterface | null = null;
 let initializationAttempted = false;
 
 async function initRealQueue(): Promise<boolean> {
@@ -29,23 +38,20 @@ async function initRealQueue(): Promise<boolean> {
   initializationAttempted = true;
 
   try {
+    const { Queue } = await import('bullmq');
     const connection = await getRedisClient();
-    realQueue = new Queue<ApprovalJobData>('approval-requests', {
+    
+    const QueueConstructor = Queue as unknown as new (name: string, opts: {
+      connection: unknown;
+      defaultJobOptions?: { removeOnComplete?: { count?: number }; removeOnFail?: { count?: number } };
+    }) => QueueInterface;
+    
+    realQueue = new QueueConstructor('approval-requests', {
       connection,
       defaultJobOptions: {
         removeOnComplete: { count: 1000 },
         removeOnFail: { count: 5000 },
       },
-    });
-
-    // Try to add a test job to verify BullMQ works
-    await realQueue.add('init-test', {
-      id: 'init-test',
-      toolName: 'test',
-      preview: 'test',
-      timestamp: Date.now(),
-      chatId: 0,
-      status: 'pending'
     });
 
     console.log('[Queue] Using BullMQ with Redis');
@@ -54,19 +60,19 @@ async function initRealQueue(): Promise<boolean> {
     console.warn('[Queue] BullMQ/Redis not available, using in-memory fake queue');
     console.warn('[Queue] Error:', error instanceof Error ? error.message : String(error));
     useFakeQueue = true;
-    fakeQueue = getFakeApprovalQueue();
+    fakeQueue = getFakeApprovalQueue() as unknown as QueueInterface;
     return false;
   }
 }
 
-export async function getQueue(): Promise<Queue<ApprovalJobData> | typeof fakeQueue> {
+export async function getQueue(): Promise<QueueInterface> {
   if (useFakeQueue) {
-    return fakeQueue;
+    return fakeQueue!;
   }
   if (!realQueue) {
     await initRealQueue();
   }
-  return useFakeQueue ? fakeQueue : realQueue!;
+  return useFakeQueue ? fakeQueue! : realQueue!;
 }
 
 export async function addApprovalJob(data: ApprovalJobData): Promise<string> {

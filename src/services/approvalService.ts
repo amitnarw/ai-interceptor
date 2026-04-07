@@ -2,7 +2,11 @@ import { addApprovalJob, getApprovalJob, updateApprovalStatus, ApprovalJobData }
 import { classifyTool } from '../filters/toolFilter.js';
 import { modeManager } from '../config/mode.js';
 import { telegramBot } from '../telegram/bot.js';
-import { formatToolApprovalMessage } from '../telegram/keyboards.js';
+import {
+  startStatus,
+  setApprovalRequired,
+  setApprovalResult,
+} from './liveStatus.js';
 import axios from 'axios';
 
 const CUSTOM_INPUT_TIMEOUT_MS = 60000; // 60 seconds
@@ -161,7 +165,7 @@ class ApprovalService {
     preview: string,
     chatId: number
   ): Promise<{ approved: boolean; customContext?: string }> {
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       // Add job to queue
       const jobData: ApprovalJobData = {
         id: requestId,
@@ -188,9 +192,9 @@ class ApprovalService {
         timeout,
       });
 
-      // Send Telegram message with buttons
-      const message = formatToolApprovalMessage(toolName, filePath, preview, requestId);
-      telegramBot.sendMessage(chatId, message.text);
+      // Start status tracking and set approval required
+      startStatus(chatId);
+      setApprovalRequired(chatId, requestId, toolName, filePath, preview);
 
       // Start polling for job status changes
       this.startPolling(requestId);
@@ -207,6 +211,10 @@ class ApprovalService {
       return;
     }
 
+    // Get chatId for status update
+    const job = await getApprovalJob(requestId);
+    const chatId = job?.chatId ?? 0;
+
     // Clear timeout and polling
     clearTimeout(pending.timeout);
     this.stopPolling(requestId);
@@ -221,6 +229,9 @@ class ApprovalService {
     // Update job status
     const status = action === 'approve' ? 'approved' : 'rejected';
     await updateApprovalStatus(requestId, status);
+
+    // Update live status
+    setApprovalResult(chatId, status, job?.toolName);
 
     // Resolve the pending request
     pending.resolve({ approved: action === 'approve' });
@@ -243,7 +254,7 @@ class ApprovalService {
     const chatId = (await getApprovalJob(requestId))?.chatId;
     if (!chatId) return;
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>(async (resolve) => {
       // Set 60 second timeout for custom input
       const timeout = setTimeout(() => {
         this.handleCustomInputTimeout(requestId, originalResolve);
@@ -264,14 +275,17 @@ class ApprovalService {
         timeout,
       });
 
-      // Ask user for modification text
-      const message = `✏️ *Enter your modification:*
+      // Ask user for modification text via force_reply
+      const message = `Enter your modification:
 
 Please describe how you'd like to modify the tool execution. The AI will incorporate your feedback.
 
-_Timeout: 60 seconds_`;
+Timeout: 60 seconds`;
 
-      telegramBot.sendMessage(chatId, message);
+      const forceReplyMsgId = await telegramBot.sendMessageForceReply(chatId, message);
+      if (forceReplyMsgId) {
+        telegramBot.setCustomInputMessageId(chatId, forceReplyMsgId);
+      }
 
       // Note: resolve will be called when user provides input or timeout occurs
     });
@@ -321,11 +335,14 @@ _Timeout: 60 seconds_`;
 
     console.log(`[ApprovalService] Custom input timeout for ${requestId}`);
 
-    // Notify user
-    telegramBot.sendMessage(customInput.chatId, '⏱️ Custom input timeout. Tool call rejected.');
+    // Clear custom input state in bot
+    telegramBot.clearCustomInputState(customInput.chatId);
 
     // Update job status
     await updateApprovalStatus(requestId, 'timeout');
+
+    // Update live status
+    setApprovalResult(customInput.chatId, 'timeout', customInput.toolName);
 
     // Resolve as rejected
     originalResolve({ approved: false });
@@ -345,8 +362,16 @@ _Timeout: 60 seconds_`;
 
     console.log(`[ApprovalService] Approval timeout for ${requestId}`);
 
+    // Get job info for status update
+    const job = await getApprovalJob(requestId);
+
     // Update job status
     await updateApprovalStatus(requestId, 'timeout');
+
+    // Update live status
+    if (job) {
+      setApprovalResult(job.chatId, 'timeout', job.toolName);
+    }
 
     // Resolve as rejected
     pending.resolve({ approved: false });

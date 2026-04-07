@@ -19,7 +19,9 @@
       "Bash(node dist/server.js)",
       "Bash(curl -s -X POST http://localhost:4000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
       "Bash(pkill -f \"node dist/server.js\")",
-      "Bash(taskkill //F //IM node.exe)"
+      "Bash(taskkill //F //IM node.exe)",
+      "Bash(pnpm vitest:*)",
+      "Bash(pnpm tsc:*)"
     ]
   }
 }

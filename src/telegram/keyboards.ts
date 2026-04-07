@@ -6,10 +6,10 @@ export function buildApprovalKeyboard(requestId: string): ApprovalKeyboard {
   return {
     inline_keyboard: [
       [
-        { text: '✅ Accept', callback_data: `approve:${requestId}` },
-        { text: '❌ Reject', callback_data: `reject:${requestId}` },
+        { text: 'Accept', callback_data: `approve:${requestId}` },
+        { text: 'Reject', callback_data: `reject:${requestId}` },
       ],
-      [{ text: '✏️ Custom', callback_data: `custom:${requestId}` }],
+      [{ text: 'Custom', callback_data: `custom:${requestId}` }],
     ],
   };
 }
@@ -28,19 +28,54 @@ export function formatToolApprovalMessage(
   const escapedTool = escapeMarkdown(toolName);
   const escapedPreview = escapeMarkdown(preview.substring(0, 500));
 
-  let text = `⚡ *Tool Call Requested*\n\n`;
-  text += `🔧 *Tool:* \`${escapedTool}\`\n`;
+  let text = `*Tool Call Requested*\n\n`;
+  text += `Tool: \`${escapedTool}\`\n`;
 
   if (filePath) {
     const escapedPath = escapeMarkdown(filePath);
-    text += `📄 *File:* \`${escapedPath}\`\n`;
+    text += `File: \`${escapedPath}\`\n`;
   }
 
-  text += `\n📝 *Preview:*\n\`\`\`\n${escapedPreview}\n\`\`\`\n`;
+  text += `\nPreview:\n\`\`\`\n${escapedPreview}\n\`\`\`\n`;
 
   return {
     text,
     reply_markup: buildApprovalKeyboard(requestId),
+  };
+}
+
+export function buildCommandKeyboard(): ApprovalKeyboard {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Status', callback_data: 'cmd:status' },
+        { text: 'Away', callback_data: 'cmd:away' },
+        { text: 'Desk', callback_data: 'cmd:desk' },
+      ],
+      [
+        { text: 'Clear', callback_data: 'cmd:clear' },
+      ],
+    ],
+  };
+}
+
+export function buildApprovalPlusCommandKeyboard(requestId: string): ApprovalKeyboard {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Accept', callback_data: `approve:${requestId}` },
+        { text: 'Reject', callback_data: `reject:${requestId}` },
+        { text: 'Custom', callback_data: `custom:${requestId}` },
+      ],
+      [
+        { text: 'Status', callback_data: 'cmd:status' },
+        { text: 'Away', callback_data: 'cmd:away' },
+        { text: 'Desk', callback_data: 'cmd:desk' },
+      ],
+      [
+        { text: 'Clear', callback_data: 'cmd:clear' },
+      ],
+    ],
   };
 }
 

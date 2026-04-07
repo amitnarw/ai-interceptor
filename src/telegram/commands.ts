@@ -2,6 +2,7 @@ import { telegramBot } from './bot.js';
 import { modeManager } from '../config/mode.js';
 import { config } from '../config/index.js';
 import { approvalService } from '../services/approvalService.js';
+import { buildCommandKeyboard } from './keyboards.js';
 
 const LAST_TOOL_CALLS_MAX = 5;
 
@@ -26,25 +27,38 @@ export function clearToolCalls(): void {
 
 function getStatusMessage(): string {
   const mode = modeManager.getMode();
-  const modeEmoji = mode === 'away' ? '🔴' : '🟢';
+  const modeIndicator = mode === 'away' ? '[AWAY]' : '[DESK]';
   const modeText = mode === 'away' ? 'AWAY (approvals required)' : 'DESK (transparent passthrough)';
 
-  let message = `${modeEmoji} *Mode:* ${modeText}\n`;
-  message += `🤖 *Proxy:* Active\n`;
-  message += `⏱️ *Timeout:* ${config.autoRejectTimeoutMs / 1000 / 60} minutes\n\n`;
+  let message = `${modeIndicator} Mode: ${modeText}\n`;
+  message += `Proxy: Active\n`;
+  message += `Timeout: ${config.autoRejectTimeoutMs / 1000 / 60} minutes\n\n`;
 
   if (recentToolCalls.length > 0) {
-    message += `📋 *Recent Tool Calls:*\n`;
+    message += `Recent Tool Calls:\n`;
     for (const call of recentToolCalls) {
       const time = new Date(call.timestamp).toLocaleTimeString();
       const file = call.file ? ` (${call.file})` : '';
-      message += `• ${call.tool}${file} - ${time}\n`;
+      message += `- ${call.tool}${file} - ${time}\n`;
     }
   } else {
-    message += `📋 *Recent Tool Calls:* None`;
+    message += `Recent Tool Calls: None`;
   }
 
   return message;
+}
+
+async function editPinnedMessage(chatId: number, text: string): Promise<void> {
+  const pinnedId = telegramBot.getPinnedMessageId(chatId);
+  if (pinnedId !== undefined) {
+    await telegramBot.editMessage(chatId, pinnedId, text, buildCommandKeyboard());
+  } else {
+    // No pinned message yet — send and pin one
+    const sent = await telegramBot.sendMessageWithId(chatId, text, buildCommandKeyboard());
+    if (sent?.message_id) {
+      await telegramBot.pinChatMessage(chatId, sent.message_id);
+    }
+  }
 }
 
 export async function handleCommand(
@@ -62,27 +76,27 @@ export async function handleCommand(
 
     case '/away':
       modeManager.setMode('away');
-      await telegramBot.sendMessage(
+      await editPinnedMessage(
         chatId,
-        `🔴 Switched to *AWAY* mode.\nTool calls will require approval via Telegram.`
+        `Switched to AWAY mode.\nTool calls will require approval via Telegram.`
       );
       break;
 
     case '/desk':
       modeManager.setMode('desk');
-      await telegramBot.sendMessage(
+      await editPinnedMessage(
         chatId,
-        `🟢 Switched to *DESK* mode.\nAll requests will pass through transparently.`
+        `Switched to DESK mode.\nAll requests will pass through transparently.`
       );
       break;
 
     case '/status':
-      await telegramBot.sendMessage(chatId, getStatusMessage());
+      await editPinnedMessage(chatId, getStatusMessage());
       break;
 
     case '/clear':
       clearToolCalls();
-      await telegramBot.sendMessage(chatId, '🗑️ Cleared recent tool call history.');
+      await editPinnedMessage(chatId, 'Cleared recent tool call history.');
       break;
 
     case '/callback':
@@ -91,10 +105,8 @@ export async function handleCommand(
 
     default:
       if (!command?.startsWith('/')) {
-        await telegramBot.sendMessage(
-          chatId,
-          `I don't understand that command. Try /status, /away, or /desk.`
-        );
+        // No response for unknown text — chat input is ignored
+        return;
       }
       break;
   }
@@ -102,25 +114,18 @@ export async function handleCommand(
 
 async function sendStartMessage(chatId: number): Promise<void> {
   const message = `
-🤖 *Proxy Telegram Agent*
+*Proxy Telegram Agent*
 
 This bot controls your local AI proxy.
 
-*Commands:*
-• /away - Enable approval mode
-• /desk - Disable approval mode
-• /status - Current status
-• /clear - Clear tool history
-
-_Proxy runs on port ${config.proxyPort}_
+Use the command buttons below to control the proxy.
+Proxy runs on port ${config.proxyPort}
 `;
-
-  await telegramBot.sendMessage(chatId, message);
+  await editPinnedMessage(chatId, message);
 }
 
 async function handleCallback(parts: string[], chatId: number): Promise<void> {
   if (parts.length < 2) {
-    await telegramBot.sendMessage(chatId, 'Invalid callback data.');
     return;
   }
 
@@ -128,7 +133,6 @@ async function handleCallback(parts: string[], chatId: number): Promise<void> {
   const callbackParts = callbackData.split(':');
 
   if (callbackParts.length < 2) {
-    await telegramBot.sendMessage(chatId, 'Invalid callback format.');
     return;
   }
 
@@ -136,23 +140,22 @@ async function handleCallback(parts: string[], chatId: number): Promise<void> {
   const requestId = callbackParts.slice(1).join(':');
 
   switch (action) {
+    // Inline keyboard command buttons
+    case 'cmd':
+      await handleCommand(`/${requestId}`, chatId, 0);
+      break;
+
+    // Approval action buttons
     case 'approve':
       await approvalService.handleApproval(requestId, 'approve');
-      await telegramBot.sendMessage(chatId, `✅ Tool call *approved*.`);
       break;
 
     case 'reject':
       await approvalService.handleApproval(requestId, 'reject');
-      await telegramBot.sendMessage(chatId, `❌ Tool call *rejected*.`);
       break;
 
     case 'custom':
-      // handleApproval('custom') triggers requestCustomInput which sends the prompt
       await approvalService.handleApproval(requestId, 'custom');
-      // User will receive the modification prompt from requestCustomInput
       break;
-
-    default:
-      await telegramBot.sendMessage(chatId, `Unknown action: ${action}`);
   }
 }

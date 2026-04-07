@@ -5,6 +5,13 @@ import { config } from '../config/index.js';
 import { approvalService } from '../services/approvalService.js';
 import { modeManager } from '../config/mode.js';
 import { MiniMaxAPIError, TimeoutError, parseMiniMaxError } from '../middleware/errorHandler.js';
+import { SSEParser } from '../utils/sseParser.js';
+import {
+  startStatus,
+  addStatusEvent,
+  completeStatus,
+  appendSseText,
+} from '../services/liveStatus.js';
 
 const router = Router();
 
@@ -31,12 +38,10 @@ async function handleOpenAIRequest(req: Request, res: Response): Promise<void> {
   const stream = requestBody.stream ?? false;
 
   try {
-    // Check if we need approval (AWAY mode + streaming + tools)
     if (stream && modeManager.isAwayMode() && requestBody.tools && requestBody.tools.length > 0) {
       await handleStreamingWithApproval(req, res, requestBody);
     } else {
-      // Normal passthrough
-      await forwardToMiniMax(req, res, requestBody);
+      await forwardToMiniMax(req, res, requestBody, !stream);
     }
   } catch (error) {
     // Handle known error types
@@ -103,7 +108,8 @@ async function handleStreamingWithApproval(
   res: Response,
   requestBody: OpenAIRequest
 ): Promise<void> {
-  // Make non-streaming peek request to detect tool calls
+  const chatId = parseInt(config.telegramChatId, 10);
+
   console.log('[OpenAI] Making peek request to detect tool calls...');
 
   let peekResult;
@@ -115,39 +121,34 @@ async function handleStreamingWithApproval(
       'openai'
     );
   } catch (error) {
-    // Re-throw known errors
     if (error instanceof MiniMaxAPIError || error instanceof TimeoutError) {
       throw error;
     }
-    // Wrap unknown errors
     console.error('[OpenAI] Peek request failed:', error);
     throw new MiniMaxAPIError(500, 'Failed to detect tool calls', 'peek_failed');
   }
 
   if (!peekResult.hasToolCalls) {
     console.log('[OpenAI] No tool calls detected, streaming normally');
-    await forwardToMiniMax(req, res, requestBody);
+    await forwardToMiniMax(req, res, requestBody, true);
     return;
   }
 
-  // Check if any tools need interception
   const interceptTools = peekResult.toolCalls.filter(tc =>
     approvalService.needsApproval([{ name: tc.name }])
   );
 
   if (interceptTools.length === 0) {
     console.log('[OpenAI] No intercept tools, streaming normally');
-    await forwardToMiniMax(req, res, requestBody);
+    await forwardToMiniMax(req, res, requestBody, true);
     return;
   }
 
   console.log(`[OpenAI] Detected ${interceptTools.length} intercept tool(s), requesting approval`);
 
-  // Request approval for first intercept tool
   const firstTool = interceptTools[0];
   const requestId = approvalService.generateRequestId();
 
-  // Extract preview from arguments
   let preview = firstTool.arguments;
   let filePath: string | undefined;
 
@@ -156,20 +157,19 @@ async function handleStreamingWithApproval(
     filePath = args.path || args.file || args.filePath;
     preview = args.content || args.code || args.text || firstTool.arguments;
   } catch {
-    // Use raw arguments as preview
   }
 
-  // Request approval
   const approvalResult = await approvalService.requestApproval(
     requestId,
     firstTool.name,
     filePath,
     preview.substring(0, 500),
-    parseInt(config.telegramChatId, 10)
+    chatId
   );
 
   if (!approvalResult.approved) {
     console.log('[OpenAI] Tool call rejected');
+    completeStatus(chatId, false);
     res.status(403).json({
       error: 'Tool call rejected by user',
       tool: firstTool.name,
@@ -177,10 +177,8 @@ async function handleStreamingWithApproval(
     return;
   }
 
-  // Approved - inject custom context if provided
   if (approvalResult.customContext) {
     console.log('[OpenAI] Custom context provided, injecting into request');
-    // Add custom context as a system message or user message
     const customMessage = {
       role: 'user',
       content: `User modification request: ${approvalResult.customContext}`
@@ -191,16 +189,17 @@ async function handleStreamingWithApproval(
     }
   }
 
-  // Stream the response
-  await forwardToMiniMax(req, res, requestBody);
+  await forwardToMiniMax(req, res, requestBody, true);
 }
 
 async function forwardToMiniMax(
   req: Request,
   res: Response,
-  requestBody: OpenAIRequest
+  requestBody: OpenAIRequest,
+  trackStatus: boolean = false
 ): Promise<void> {
   const stream = requestBody.stream ?? false;
+  const chatId = parseInt(config.telegramChatId, 10);
 
   const response = await axios({
     method: 'POST',
@@ -214,7 +213,6 @@ async function forwardToMiniMax(
     timeout: REQUEST_TIMEOUT_MS,
   });
 
-  // Validate response data
   if (!stream && !response.data) {
     console.error('[OpenAI] Empty response from MiniMax API');
     if (!res.headersSent) {
@@ -234,11 +232,73 @@ async function forwardToMiniMax(
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Request-Id', req.headers['x-request-id'] as string || '');
 
+    if (trackStatus) {
+      startStatus(chatId);
+    }
+
     const streamData = response.data as Readable;
-    streamData.pipe(res);
+    const sseParser = new SSEParser();
+    let streamEnded = false;
+
+    streamData.on('data', (chunk: Buffer) => {
+      if (trackStatus && !streamEnded) {
+        const { events, cleanChunk } = sseParser.parse(chunk);
+
+        // Append streaming text to Telegram message
+        if (cleanChunk && cleanChunk.trim()) {
+          appendSseText(chatId, cleanChunk);
+        }
+
+        for (const event of events) {
+          if (event.type === 'text' && event.data) {
+            addStatusEvent(chatId, { type: 'text', detail: event.data });
+          } else if (event.type === 'tool_complete' && event.toolEvent) {
+            const toolName = event.toolEvent.name;
+            const path = SSEParser.extractPathFromArguments(
+              event.toolEvent.arguments ?? '',
+              toolName
+            );
+            const isIntercept = SSEParser.isInterceptTool(toolName);
+
+            addStatusEvent(chatId, {
+              type: 'tool_complete',
+              tool: toolName,
+              path,
+              detail: isIntercept ? 'approved' : 'passthrough',
+            });
+          } else if (event.type === 'done') {
+            streamEnded = true;
+            completeStatus(chatId, true);
+          }
+        }
+
+        res.write(cleanChunk || chunk.toString());
+      } else {
+        res.write(chunk);
+      }
+    });
+
+    streamData.on('end', () => {
+      if (trackStatus && !streamEnded) {
+        const { events } = sseParser.flush();
+        for (const event of events) {
+          if (event.type === 'tool_complete' && event.toolEvent) {
+            addStatusEvent(chatId, {
+              type: 'tool_complete',
+              tool: event.toolEvent.name,
+            });
+          }
+        }
+        completeStatus(chatId, true);
+      }
+      res.end();
+    });
 
     streamData.on('error', (error: Error) => {
       console.error(`[OpenAI] Stream error: ${error.message}`);
+      if (trackStatus) {
+        completeStatus(chatId, false);
+      }
       if (!res.headersSent) {
         res.status(500).json({ error: { message: 'Stream error' } });
       } else {
