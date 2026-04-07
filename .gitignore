@@ -9,6 +9,9 @@ dist/
 .env.local
 .env.*.local
 
+# Claude (includes settings.local.json which may contain secrets)
+.claude/
+
 # IDE
 .idea/
 .vscode/
