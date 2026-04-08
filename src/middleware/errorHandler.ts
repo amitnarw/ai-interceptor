@@ -60,6 +60,29 @@ export class TimeoutError extends AppError {
   }
 }
 
+// Error categorization for retry logic
+export type RetryCategory = 'rate_limit' | 'authentication_failed' | 'server_error' | 'timeout' | 'unknown';
+
+export function categorizeError(error: unknown): RetryCategory {
+  if (error instanceof TimeoutError) return 'timeout';
+  if (error instanceof MiniMaxAPIError) {
+    if (error.statusCode === 429) return 'rate_limit';
+    if (error.statusCode === 401 || error.statusCode === 403) return 'authentication_failed';
+    if (error.statusCode >= 500) return 'server_error';
+  }
+  if (error instanceof AppError) {
+    if (error.statusCode === 408) return 'timeout';
+    if (error.statusCode === 429) return 'rate_limit';
+    if (error.statusCode === 401 || error.statusCode === 403) return 'authentication_failed';
+    if (error.statusCode >= 500) return 'server_error';
+  }
+  return 'unknown';
+}
+
+export function isRetryable(category: RetryCategory): boolean {
+  return category === 'rate_limit' || category === 'server_error' || category === 'timeout';
+}
+
 // Parse MiniMax API errors
 export function parseMiniMaxError(error: unknown): MiniMaxAPIError | null {
   if (!error || typeof error !== 'object') return null;

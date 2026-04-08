@@ -13,16 +13,32 @@ export interface SSEEvent {
   data?: string;
   toolEvent?: SSEToolEvent;
   contentBlockType?: string;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
 }
 
 export class SSEParser {
   private buffer: string = '';
   private pendingToolCalls: Map<string, { name: string; arguments: string }> = new Map();
   private textBuffer: string = '';
+  private lastTextEvent: string = ''; // Track last text event to deduplicate
+
+  private static readonly MAX_BUFFER_SIZE = 1024 * 1024; // 1MB max buffer
 
   parse(chunk: Buffer): { events: SSEEvent[]; cleanChunk: string } {
     const events: SSEEvent[] = [];
-    this.buffer += chunk.toString();
+    const chunkStr = chunk.toString();
+
+    // Guard against unbounded buffer growth
+    if (this.buffer.length + chunkStr.length > SSEParser.MAX_BUFFER_SIZE) {
+      console.warn('[SSEParser] Buffer overflow, resetting');
+      this.buffer = '';
+    }
+
+    this.buffer += chunkStr;
 
     const lines = this.buffer.split(/\r?\n/);
     this.buffer = lines.pop() ?? '';
@@ -96,16 +112,34 @@ export class SSEParser {
 
       if (eventType === 'content_block_delta' || eventType === 'message_delta') {
         if (data.type === 'content_block_delta' && data.delta?.type === 'thinking_delta') {
-          this.textBuffer += data.delta.thinking ?? '';
-          return { type: 'text', data: data.delta.thinking };
+          const text = data.delta.thinking ?? '';
+          // Skip if same as last text event (deduplication for thinking content)
+          if (text === this.lastTextEvent) {
+            return null;
+          }
+          this.textBuffer += text;
+          this.lastTextEvent = text;
+          return { type: 'text', data: text };
         }
         if (data.type === 'content_block_delta' && data.delta?.type === 'text_delta') {
-          this.textBuffer += data.delta.text ?? '';
-          return { type: 'text', data: data.delta.text };
+          const text = data.delta.text ?? '';
+          // Skip if same as last text event (deduplication)
+          if (text === this.lastTextEvent) {
+            return null;
+          }
+          this.textBuffer += text;
+          this.lastTextEvent = text;
+          return { type: 'text', data: text };
         }
         if (data.type === 'message_delta' && data.delta?.type === 'text_delta') {
-          this.textBuffer += data.delta.text ?? '';
-          return { type: 'text', data: data.delta.text };
+          const text = data.delta.text ?? '';
+          // Skip if same as last text event (deduplication)
+          if (text === this.lastTextEvent) {
+            return null;
+          }
+          this.textBuffer += text;
+          this.lastTextEvent = text;
+          return { type: 'text', data: text };
         }
         if (data.type === 'content_block_delta' && data.delta?.type === 'input_json_delta') {
           const partialArg = data.delta.partial_json ?? '';
@@ -121,6 +155,10 @@ export class SSEParser {
       }
 
       if (eventType === 'message' || eventType === 'ping') {
+        // Capture usage data from message events (Anthropic API sends this at the end)
+        if (data.message?.usage) {
+          return { type: 'done', usage: data.message.usage };
+        }
         return null;
       }
 
@@ -169,8 +207,14 @@ export class SSEParser {
           }
 
           if (choice.delta?.content) {
-            this.textBuffer += choice.delta.content;
-            return { type: 'text', data: choice.delta.content };
+            const text = choice.delta.content;
+            // Skip if same as last text event (deduplication)
+            if (text === this.lastTextEvent) {
+              return null;
+            }
+            this.textBuffer += text;
+            this.lastTextEvent = text;
+            return { type: 'text', data: text };
           }
 
           if (choice.finish_reason === 'tool_calls') {

@@ -1,6 +1,7 @@
 import { addApprovalJob, getApprovalJob, updateApprovalStatus, ApprovalJobData } from '../approvals/queue.js';
 import { classifyTool } from '../filters/toolFilter.js';
 import { modeManager } from '../config/mode.js';
+import { config } from '../config/index.js';
 import { telegramBot } from '../telegram/bot.js';
 import {
   startStatus,
@@ -15,6 +16,10 @@ export interface ApprovalRequest {
   id: string;
   resolve: (result: { approved: boolean; customContext?: string }) => void;
   timeout: ReturnType<typeof setTimeout>;
+  startTime: number;
+  toolName: string;
+  resolved?: boolean; // Flag to prevent double resolution race condition
+  reminderTimers?: ReturnType<typeof setTimeout>[];
 }
 
 export interface CustomInputRequest {
@@ -179,8 +184,8 @@ class ApprovalService {
 
       addApprovalJob(jobData);
 
-      // Set up timeout (use configured timeout from mode manager)
-      const timeoutMs = 10 * 60 * 1000; // 10 minutes - should match config
+      // Set up timeout - use configured timeout
+      const timeoutMs = config.autoRejectTimeoutMs;
       const timeout = setTimeout(() => {
         this.handleApprovalTimeout(requestId);
       }, timeoutMs);
@@ -190,11 +195,39 @@ class ApprovalService {
         id: requestId,
         resolve,
         timeout,
+        startTime: Date.now(),
+        toolName,
       });
 
       // Start status tracking and set approval required
       startStatus(chatId);
       setApprovalRequired(chatId, requestId, toolName, filePath, preview);
+
+      // Schedule Telegram reminders at 30s and 60s if timeout is > 60s
+      if (timeoutMs > 60000) {
+        const reminder1 = setTimeout(() => {
+          const pending = this.pendingApprovals.get(requestId);
+          if (pending && !pending.resolved) {
+            telegramBot.sendMessage(chatId,
+              `⏰ Reminder: Approval pending for "${toolName}"\nAuto-reject in 60s.`
+            );
+          }
+        }, 30000);
+
+        const reminder2 = setTimeout(() => {
+          const pending = this.pendingApprovals.get(requestId);
+          if (pending && !pending.resolved) {
+            telegramBot.sendMessage(chatId,
+              `⚠️ Final warning: Approval for "${toolName}" timed out in 30s.`
+            );
+          }
+        }, 60000);
+
+        const pending = this.pendingApprovals.get(requestId);
+        if (pending) {
+          pending.reminderTimers = [reminder1, reminder2];
+        }
+      }
 
       // Start polling for job status changes
       this.startPolling(requestId);
@@ -211,12 +244,18 @@ class ApprovalService {
       return;
     }
 
+    // Mark as resolved FIRST to prevent race with polling
+    pending.resolved = true;
+
     // Get chatId for status update
     const job = await getApprovalJob(requestId);
     const chatId = job?.chatId ?? 0;
 
-    // Clear timeout and polling
+    // Clear timeout, reminders, and polling
     clearTimeout(pending.timeout);
+    if (pending.reminderTimers) {
+      pending.reminderTimers.forEach(t => clearTimeout(t));
+    }
     this.stopPolling(requestId);
 
     if (action === 'custom') {
@@ -232,6 +271,10 @@ class ApprovalService {
 
     // Update live status
     setApprovalResult(chatId, status, job?.toolName);
+
+    // Log duration
+    const duration = Date.now() - pending.startTime;
+    console.log(`[ApprovalService] Request ${requestId} (${pending.toolName}) ${status} in ${duration}ms`);
 
     // Resolve the pending request
     pending.resolve({ approved: action === 'approve' });
@@ -316,6 +359,11 @@ Timeout: 60 seconds`;
     // Also resolve the original approval request
     const pending = this.pendingApprovals.get(requestId);
     if (pending) {
+      const duration = Date.now() - pending.startTime;
+      console.log(`[ApprovalService] Request ${requestId} (${pending.toolName}) custom approved in ${duration}ms`);
+      if (pending.reminderTimers) {
+        pending.reminderTimers.forEach(t => clearTimeout(t));
+      }
       pending.resolve({ approved: true, customContext: customText });
       this.pendingApprovals.delete(requestId);
     }
@@ -347,6 +395,12 @@ Timeout: 60 seconds`;
     // Resolve as rejected
     originalResolve({ approved: false });
 
+    // Clear reminder timers
+    const pending = this.pendingApprovals.get(requestId);
+    if (pending?.reminderTimers) {
+      pending.reminderTimers.forEach(t => clearTimeout(t));
+    }
+
     // Remove from pending approvals
     this.pendingApprovals.delete(requestId);
   }
@@ -373,8 +427,17 @@ Timeout: 60 seconds`;
       setApprovalResult(job.chatId, 'timeout', job.toolName);
     }
 
+    // Log duration
+    const duration = Date.now() - pending.startTime;
+    console.log(`[ApprovalService] Request ${requestId} (${pending.toolName}) timed out after ${duration}ms`);
+
     // Resolve as rejected
     pending.resolve({ approved: false });
+
+    // Clear reminder timers if still pending
+    if (pending.reminderTimers) {
+      pending.reminderTimers.forEach(t => clearTimeout(t));
+    }
 
     // Remove from pending
     this.pendingApprovals.delete(requestId);
@@ -393,7 +456,9 @@ Timeout: 60 seconds`;
         this.stopPolling(requestId);
 
         const pending = this.pendingApprovals.get(requestId);
-        if (pending) {
+        // Only resolve if not already resolved by handleApproval (race condition fix)
+        if (pending && !pending.resolved) {
+          pending.resolved = true;
           clearTimeout(pending.timeout);
           pending.resolve({ approved: job.status === 'approved', customContext: job.customContext });
           this.pendingApprovals.delete(requestId);

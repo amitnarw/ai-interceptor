@@ -14,9 +14,9 @@ let lastSentMessage: TelegramMessage | null = null;
 const MESSAGE_RATE_LIMIT = 1000;
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5;
+const BASE_BACKOFF_MS = 2000;
+const MAX_BACKOFF_MS = 60000;
 
-// Map chatId -> pinned message ID
-const pinnedMessageId: Map<number, number> = new Map();
 // Map chatId -> requestId pending custom input
 const pendingCustomInputChat: Map<number, string> = new Map();
 // Map chatId -> message ID of the force_reply prompt
@@ -106,11 +106,13 @@ async function poll(): Promise<void> {
       consecutiveErrors = 0;
     } catch (error) {
       consecutiveErrors++;
-      console.error(`[Telegram] Poll error (${consecutiveErrors}):`, error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[Telegram] Poll error (${consecutiveErrors}): ${errorMsg}`);
 
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        console.error('[Telegram] Too many consecutive errors, backing off...');
-        await sleep(30000);
+        const backoffMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, consecutiveErrors - 1), MAX_BACKOFF_MS);
+        console.error(`[Telegram] Too many consecutive errors, backing off for ${backoffMs}ms...`);
+        await sleep(backoffMs);
       } else {
         await sleep(5000);
       }
@@ -258,7 +260,7 @@ async function sendMessageWithId(
     messageQueue.push({ chatId, text, replyMarkup });
     await processQueue();
     const sent = lastSentMessage;
-    console.log(`[Telegram] sendMessageWithId got lastSentMessage:`, sent);
+    console.log(`[Telegram] sendMessageWithId got lastSentMessage:`, JSON.stringify(sent));
     lastSentMessage = null;
     return sent;
   } catch (error) {
@@ -370,46 +372,6 @@ async function setMyCommands(): Promise<void> {
   }
 }
 
-async function pinChatMessage(chatId: number, messageId: number): Promise<void> {
-  const url = `https://api.telegram.org/bot${token}/pinChatMessage`;
-  console.log(`[Telegram] Attempting to pin message ${messageId} for chat ${chatId}`);
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
-    });
-    const data = (await response.json()) as { ok: boolean; description?: string };
-    if (!data.ok) {
-      console.warn(`[Telegram] pinChatMessage failed: ${data.description}`);
-    } else {
-      console.log(`[Telegram] Successfully pinned message ${messageId}`);
-      pinnedMessageId.set(chatId, messageId);
-    }
-  } catch (error) {
-    console.warn('[Telegram] pinChatMessage error:', error);
-  }
-}
-
-async function unpinChatMessage(chatId: number): Promise<void> {
-  const url = `https://api.telegram.org/bot${token}/unpinChatMessage`;
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId }),
-    });
-    const data = (await response.json()) as { ok: boolean; description?: string };
-    if (!data.ok) {
-      console.warn(`[Telegram] unpinChatMessage failed: ${data.description}`);
-    } else {
-      pinnedMessageId.delete(chatId);
-    }
-  } catch (error) {
-    console.warn('[Telegram] unpinChatMessage error:', error);
-  }
-}
-
 async function sendMessageForceReply(chatId: number, text: string): Promise<number | null> {
   try {
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -507,10 +469,6 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Accessors ───────────────────────────────────────────────────────────────
 
-function getPinnedMessageId(chatId: number): number | undefined {
-  return pinnedMessageId.get(chatId);
-}
-
 function setCustomInputMessageId(chatId: number, messageId: number): void {
   customInputMessageId.set(chatId, messageId);
 }
@@ -534,9 +492,6 @@ export const telegramBot = {
   sendMessageWithId,
   editMessage,
   editMessageReplyMarkup,
-  pinChatMessage,
-  unpinChatMessage,
-  getPinnedMessageId,
   sendMessageForceReply,
   setCustomInputMessageId,
   clearCustomInputState,

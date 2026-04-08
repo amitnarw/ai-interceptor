@@ -37,7 +37,7 @@ export const config: Config = {
   telegramChatId: getEnv('TELEGRAM_CHAT_ID', ''),
   proxyPort: getEnvInt('PROXY_PORT', 4000),
   mode: (getEnv('MODE', 'desk') as 'desk' | 'away'),
-  autoRejectTimeoutMs: getEnvInt('AUTO_REJECT_TIMEOUT_MS', 600000),
+  autoRejectTimeoutMs: getEnvInt('AUTO_REJECT_TIMEOUT_MS', 90000),
 };
 
 const dataDir = path.join(process.cwd(), 'data');

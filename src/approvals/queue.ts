@@ -22,7 +22,7 @@ interface QueueInterface {
   getActive: () => Promise<{ data: ApprovalJobData }[]>;
   getDelayed: () => Promise<{ data: ApprovalJobData }[]>;
   moveToCompleted: (data: ApprovalJobData, token?: string, keepJob?: boolean) => Promise<void>;
-  moveToFailed: (err: Error, token?: string, keepJob?: boolean) => Promise<void>;
+  moveToFailed: (err: Error, token?: string, keepJob?: boolean, explicitJobId?: string) => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -136,7 +136,7 @@ export async function updateApprovalStatus(
     await queue.moveToCompleted(data, 'true', true);
   } else if (status === 'rejected' || status === 'timeout') {
     const reason = status === 'timeout' ? 'Approval timeout' : `Rejected: ${customContext || 'no context'}`;
-    await queue.moveToFailed(new Error(reason), 'true', true);
+    await queue.moveToFailed(new Error(reason), 'true', true, jobId);
   }
 }
 

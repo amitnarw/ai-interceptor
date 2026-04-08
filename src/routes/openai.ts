@@ -1,16 +1,19 @@
 import { Router, Request, Response } from 'express';
-import axios from 'axios';
 import { Readable } from 'stream';
 import { config } from '../config/index.js';
 import { approvalService } from '../services/approvalService.js';
 import { modeManager } from '../config/mode.js';
 import { MiniMaxAPIError, TimeoutError, parseMiniMaxError } from '../middleware/errorHandler.js';
 import { SSEParser } from '../utils/sseParser.js';
+import { axiosClient } from '../utils/axiosClient.js';
+import axios from 'axios';
 import {
   startStatus,
   addStatusEvent,
+  appendSseText,
   completeStatus,
   getStatusState,
+  setTokens,
 } from '../services/liveStatus.js';
 
 const router = Router();
@@ -110,6 +113,9 @@ async function handleStreamingWithApproval(
 ): Promise<void> {
   const chatId = parseInt(config.telegramChatId, 10);
 
+  // Show thinking status immediately before peek request starts
+  startStatus(chatId);
+
   console.log('[OpenAI] Making peek request to detect tool calls...');
 
   let peekResult;
@@ -146,6 +152,16 @@ async function handleStreamingWithApproval(
 
   console.log(`[OpenAI] Detected ${interceptTools.length} intercept tool(s), requesting approval`);
 
+  if (interceptTools.length > 1) {
+    console.log('[OpenAI] Multiple intercept tools detected, rejecting request');
+    completeStatus(chatId, false);
+    res.status(400).json({
+      error: 'Multiple intercept tools detected. Please retry with one tool at a time.',
+      tools: interceptTools.map(t => t.name),
+    });
+    return;
+  }
+
   const firstTool = interceptTools[0];
   const requestId = approvalService.generateRequestId();
 
@@ -168,25 +184,32 @@ async function handleStreamingWithApproval(
   );
 
   if (!approvalResult.approved) {
-    console.log('[OpenAI] Tool call rejected');
+    console.log('[OpenAI] Tool call rejected, synthesizing SSE end_turn');
     completeStatus(chatId, false);
-    res.status(403).json({
-      error: 'Tool call rejected by user',
-      tool: firstTool.name,
-    });
+
+    // Synthesize a valid SSE stream that signals the turn is complete.
+    // This prevents Claude Code from seeing a 403 auth error.
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.write('event: message_stop\ndata: {}\n\n');
+    res.end();
     return;
   }
 
   if (approvalResult.customContext) {
-    console.log('[OpenAI] Custom context provided, injecting into request');
-    const customMessage = {
-      role: 'user',
-      content: `User modification request: ${approvalResult.customContext}`
-    };
+    // Cannot inject a mid-stream user message — the SSE stream is assistant role only.
+    // Instead, synthesize rejection SSE and show custom context in Telegram so the
+    // user can naturally include it in their next prompt.
+    console.log('[OpenAI] Custom context noted, synthesizing rejection SSE');
+    completeStatus(chatId, false, `Custom feedback: ${approvalResult.customContext}`);
 
-    if (Array.isArray(requestBody.messages)) {
-      requestBody.messages.push(customMessage);
-    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.write('event: message_stop\ndata: {}\n\n');
+    res.end();
+    return;
   }
 
   // Preserve the existing messageId so we don't create a new pinned message
@@ -204,7 +227,7 @@ async function forwardToMiniMax(
   const stream = requestBody.stream ?? false;
   const chatId = parseInt(config.telegramChatId, 10);
 
-  const response = await axios({
+  const response = await axiosClient({
     method: 'POST',
     url: MINIMAX_OPENAI_URL,
     headers: {
@@ -242,6 +265,7 @@ async function forwardToMiniMax(
     const streamData = response.data as Readable;
     const sseParser = new SSEParser();
     let streamEnded = false;
+    let responseEnded = false;
 
     streamData.on('data', (chunk: Buffer) => {
       if (trackStatus && !streamEnded) {
@@ -249,7 +273,7 @@ async function forwardToMiniMax(
 
         for (const event of events) {
           if (event.type === 'text' && event.data) {
-            addStatusEvent(chatId, { type: 'text', detail: event.data });
+            appendSseText(chatId, event.data);
           } else if (event.type === 'content_block' && event.contentBlockType === 'thinking') {
             addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'tool_complete' && event.toolEvent) {
@@ -268,6 +292,9 @@ async function forwardToMiniMax(
             });
           } else if (event.type === 'done') {
             streamEnded = true;
+            if (event.usage) {
+              setTokens(chatId, event.usage);
+            }
             completeStatus(chatId, true);
           }
         }
@@ -279,6 +306,8 @@ async function forwardToMiniMax(
     });
 
     streamData.on('end', () => {
+      if (responseEnded) return;
+      responseEnded = true;
       if (trackStatus && !streamEnded) {
         const { events } = sseParser.flush();
         for (const event of events) {
@@ -296,6 +325,8 @@ async function forwardToMiniMax(
 
     streamData.on('error', (error: Error) => {
       console.error(`[OpenAI] Stream error: ${error.message}`);
+      if (responseEnded) return;
+      responseEnded = true;
       if (trackStatus) {
         completeStatus(chatId, false);
       }
@@ -310,21 +341,29 @@ async function forwardToMiniMax(
       console.error(`[OpenAI] Response error: ${error.message}`);
       streamData.destroy();
     });
+
+    res.on('close', () => {
+      // Client disconnected - clean up stream
+      if (!responseEnded) {
+        responseEnded = true;
+        console.log('[OpenAI] Client disconnected');
+        streamData.destroy();
+        if (trackStatus) {
+          completeStatus(chatId, false);
+        }
+      }
+    });
   } else {
+    // Non-streaming response - still track status
+    if (trackStatus) {
+      startStatus(chatId);
+    }
     res.status(response.status).json(response.data);
+    if (trackStatus) {
+      completeStatus(chatId, true);
+    }
   }
 }
-
-// Handle axios timeout errors
-axios.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (axios.isAxiosError(error) && error.code === 'ECONNABORTED') {
-      return Promise.reject(new TimeoutError('Request to MiniMax API timed out'));
-    }
-    return Promise.reject(error);
-  }
-);
 
 router.post('/v1/chat/completions', handleOpenAIRequest);
 

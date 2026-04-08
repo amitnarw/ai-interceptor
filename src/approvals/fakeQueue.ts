@@ -41,16 +41,22 @@ export class FakeApprovalQueue extends EventEmitter {
     console.log(`[FakeQueue] Job ${result.id} completed`);
   }
 
-  async moveToFailed(error: Error, _token?: string, _keepJob?: boolean): Promise<void> {
-    // Try to extract job ID from error message
-    let jobId = 'unknown';
-    const job = Array.from(this.jobs.values()).find(j =>
-      error.message.includes(j.id) ||
-      (j.data.status === 'pending' && j.state === 'waiting')
-    );
+  async moveToFailed(error: Error, _token?: string, _keepJob?: boolean, explicitJobId?: string): Promise<void> {
+    // Use explicit jobId if provided, otherwise try to find matching job
+    let jobId = explicitJobId ?? 'unknown';
+    let job = explicitJobId ? this.jobs.get(explicitJobId) : undefined;
+
+    if (!job) {
+      job = Array.from(this.jobs.values()).find(j =>
+        (explicitJobId && j.id === explicitJobId) ||
+        (!explicitJobId && j.data.status === 'pending' && j.state === 'waiting')
+      );
+    }
 
     if (job) {
-      jobId = job.id;
+      if (!explicitJobId) {
+        jobId = job.id;
+      }
       job.data.status = error.message.includes('timeout') ? 'timeout' : 'rejected';
       job.state = 'failed';
       this.emit('failed', job, error);

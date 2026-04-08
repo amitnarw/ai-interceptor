@@ -11,8 +11,10 @@ import { closeApprovalQueue } from './approvals/queue.js';
 import { closeApprovalWorker, createApprovalWorker } from './approvals/worker.js';
 import { closeRedis } from './config/redis.js';
 import { modeManager } from './config/mode.js';
+import { isUsingFakeQueue } from './approvals/queue.js';
 
 const app = express();
+const startTime = Date.now();
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -24,6 +26,23 @@ app.get('/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     mode: modeManager.getMode(),
     pendingApprovals: approvalService.getPendingCount(),
+  });
+});
+
+app.get('/metrics', (_req: Request, res: Response) => {
+  const memUsage = process.memoryUsage();
+  res.json({
+    uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+    mode: modeManager.getMode(),
+    pending_approvals: approvalService.getPendingCount(),
+    using_fake_queue: isUsingFakeQueue(),
+    memory: {
+      heap_used_bytes: memUsage.heapUsed,
+      heap_total_bytes: memUsage.heapTotal,
+      rss_bytes: memUsage.rss,
+      external_bytes: memUsage.external,
+    },
+    timestamp: new Date().toISOString(),
   });
 });
 

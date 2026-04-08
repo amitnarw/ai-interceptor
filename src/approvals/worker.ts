@@ -122,7 +122,7 @@ function startFakeWorker(timeoutCallback: (job: ApprovalJobData) => void): void 
         if (onApprovalTimeoutCallback) {
           await onApprovalTimeoutCallback(job.data);
         }
-        await fakeWorker.moveToFailed(new Error('Approval timeout'), 'true', true);
+        await fakeWorker.moveToFailed(new Error('Approval timeout'), 'true', true, job.id);
       }
     }
   }, 1000);

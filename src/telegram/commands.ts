@@ -1,9 +1,8 @@
-import { telegramBot } from './bot.js';
 import { modeManager } from '../config/mode.js';
 import { config } from '../config/index.js';
 import { approvalService } from '../services/approvalService.js';
 import { buildCommandKeyboard } from './keyboards.js';
-import { clearStatus } from '../services/liveStatus.js';
+import { clearStatus, sendStatusMessage } from '../services/liveStatus.js';
 
 const LAST_TOOL_CALLS_MAX = 5;
 
@@ -50,22 +49,8 @@ function getStatusMessage(): string {
 }
 
 async function editPinnedMessage(chatId: number, text: string): Promise<void> {
-  const pinnedId = telegramBot.getPinnedMessageId(chatId);
-  if (pinnedId !== undefined) {
-    console.log(`[Commands] Editing pinned message ${pinnedId}`);
-    await telegramBot.editMessage(chatId, pinnedId, text, buildCommandKeyboard());
-  } else {
-    // No pinned message yet — send and pin one
-    console.log(`[Commands] No pinned message, sending new message`);
-    const sent = await telegramBot.sendMessageWithId(chatId, text, buildCommandKeyboard());
-    console.log(`[Commands] sendMessageWithId returned:`, sent);
-    if (sent?.message_id) {
-      console.log(`[Commands] Pinning message ${sent.message_id}`);
-      await telegramBot.pinChatMessage(chatId, sent.message_id);
-    } else {
-      console.warn(`[Commands] sendMessageWithId returned null, message not sent`);
-    }
-  }
+  // Use liveStatus to send/edit the message - this ensures we always edit the same message
+  await sendStatusMessage(chatId, text, buildCommandKeyboard());
 }
 
 export async function handleCommand(
