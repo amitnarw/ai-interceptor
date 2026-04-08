@@ -162,21 +162,25 @@ class ApprovalService {
 
   /**
    * Request approval for a tool call
+   * PORTED FROM GO (seifghazi/claude-code-proxy) — enriched with fullArguments
+   * to show complete tool input in Telegram notifications (not just truncated preview).
    */
   async requestApproval(
     requestId: string,
     toolName: string,
     filePath: string | undefined,
     preview: string,
-    chatId: number
+    chatId: number,
+    fullArguments?: string
   ): Promise<{ approved: boolean; customContext?: string }> {
     return new Promise(async (resolve) => {
-      // Add job to queue
+      // Add job to queue — ported RequestLog structure with enriched tool data
       const jobData: ApprovalJobData = {
         id: requestId,
         toolName,
         filePath,
         preview,
+        fullArguments,
         timestamp: Date.now(),
         chatId,
         status: 'pending',

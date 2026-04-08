@@ -1,4 +1,23 @@
+/**
+ * SSEParser — Stateful SSE parser using eventsource-parser
+ *
+ * Ported from Go codebase (seifghazi/claude-code-proxy) concepts:
+ * - Proper line buffering via eventsource-parser (handles multi-chunk lines)
+ * - Chunk-by-chunk forwarding (real-time, not buffered)
+ * - Tool input accumulation via input_json_delta events
+ *
+ * Key differences from raw chunk.split('\n') approach:
+ * 1. eventsource-parser handles TCP chunk boundary issues internally
+ * 2. cleanChunk is reconstructed from parsed events, not raw string replacement
+ * 3. [DONE] and ping events are stripped at parse time, not via regex on raw chunk
+ */
+
+import { createParser, EventSourceMessage } from 'eventsource-parser';
 import { classifyTool } from '../filters/toolFilter.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface SSEToolEvent {
   type: 'tool_call' | 'tool_complete';
@@ -20,248 +39,216 @@ export interface SSEEvent {
   };
 }
 
+// ---------------------------------------------------------------------------
+// SSEParser
+// ---------------------------------------------------------------------------
+
 export class SSEParser {
-  private buffer: string = '';
-  private pendingToolCalls: Map<string, { name: string; arguments: string }> = new Map();
-  private textBuffer: string = '';
-  private lastTextEvent: string = ''; // Track last text event to deduplicate
+  // Tool call accumulation (indexed by tool id) — ported from Go's toolCalls[]
+  private pendingToolCalls = new Map<string, { name: string; arguments: string }>();
 
-  private static readonly MAX_BUFFER_SIZE = 1024 * 1024; // 1MB max buffer
+  // Text deduplication — skip duplicate text deltas
+  private lastTextDelta = '';
 
-  parse(chunk: Buffer): { events: SSEEvent[]; cleanChunk: string } {
-    const events: SSEEvent[] = [];
-    const chunkStr = chunk.toString();
+  // eventsource-parser instance — handles line buffering internally
+  private parser = createParser({
+    onEvent: (event: EventSourceMessage) => {
+      this.onEvent(event);
+    },
+    onComment: (_comment: string) => {
+      // Comments (lines starting with ':') are ignored — not forwarded to client
+    },
+    onError: (error: Error) => {
+      // Log but don't crash — SSE parsing continues
+      console.warn('[SSEParser] Parse error:', error.message);
+    },
+  });
 
-    // Guard against unbounded buffer growth
-    if (this.buffer.length + chunkStr.length > SSEParser.MAX_BUFFER_SIZE) {
-      console.warn('[SSEParser] Buffer overflow, resetting');
-      this.buffer = '';
+  // Pending SSE lines to forward (reconstructed from parsed events)
+  private forwardBuffer = '';
+
+  // Usage data captured from message events
+  private usage: { input_tokens: number; output_tokens: number; total_tokens: number } | undefined;
+
+  // Track if done was already emitted (prevents duplicate done events from flush)
+  private doneEmitted = false;
+
+  /**
+   * eventsource-parser event handler — called for each complete SSE event.
+   * This is the central place where we:
+   * 1. Reconstruct SSE lines for forwarding (except ping/[DONE]/comment)
+   * 2. Extract text/tool events for Telegram
+   * 3. Accumulate tool input via input_json_delta
+   */
+  private onEvent(event: EventSourceMessage): void {
+    const { event: type, data } = event;
+
+    // Comment lines (onComment handles these separately)
+    // [DONE] is just a data: [DONE] with no type — data === '[DONE]'
+    if (data === '[DONE]') {
+      // [DONE] signals end of OpenAI streaming — strip it
+      // message_stop event signals end of Anthropic streaming
+      return;
     }
 
-    this.buffer += chunkStr;
-
-    const lines = this.buffer.split(/\r?\n/);
-    this.buffer = lines.pop() ?? '';
-
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
-
-      if (line.startsWith('event:')) {
-        const eventType = line.slice(6).trim();
-        i++;
-
-        if (i < lines.length && lines[i].startsWith('data:')) {
-          const data = lines[i].slice(6).trim();
-          const parsedEvent = this.parseEventData(eventType, data);
-          if (parsedEvent) events.push(parsedEvent);
-          // Don't add SSE metadata lines to cleanChunk
-        } else if (i < lines.length && lines[i].trim() === '') {
-          i++;
-          continue;
-        } else {
-          i++;
-          continue;
-        }
-      } else if (line.startsWith('data:')) {
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') {
-          events.push({ type: 'done' });
-        } else {
-          const parsedEvent = this.parseEventData('message', data);
-          if (parsedEvent) events.push(parsedEvent);
-        }
-        i++;
-      } else if (line.trim() === '') {
-        i++;
-      } else {
-        i++;
-      }
+    if (type === 'ping') {
+      // ping events are not meaningful for client — strip them
+      return;
     }
 
-    // cleanChunk forwards raw SSE to client unchanged - only strip [DONE] and ping
-    // which should not be forwarded to the AI client
-    const raw = chunk.toString();
-    const cleanChunk = raw
-      .replace(/data: \[DONE\]\r?\n\r?\n?/g, '')
-      .replace(/event: ping\r?\n\r?\n?/g, '');
-
-    return { events, cleanChunk };
-  }
-
-  private parseEventData(eventType: string, rawData: string): SSEEvent | null {
-    if (!rawData || rawData === '[DONE]') {
-      return null;
+    if (type === 'message_stop') {
+      this.doneEmitted = true;
+      this.emittedEvents.push({ type: 'done' });
+      return;
     }
+
+    // Reconstruct SSE line for forwarding
+    // Skip lines with no meaningful data
+    if (data) {
+      const sseLine = type ? `event: ${type}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
+      this.forwardBuffer += sseLine;
+    }
+
+    // Parse the data JSON to extract display events
+    if (!data) return;
 
     try {
-      const data = JSON.parse(rawData);
-
-      // Detect actual event type from data.type for OpenAI-style chunks
-      // where event type is 'message' but data.type tells the real type
-      if (eventType === 'message' && data.type) {
-        eventType = data.type;
-      }
-
-      if (eventType === 'content_block_start' || eventType === 'message_start') {
-        if (data.type === 'content_block_start' && data.content_block?.type === 'thinking') {
-          return { type: 'content_block', contentBlockType: 'thinking' };
-        }
-        return { type: 'content_block', contentBlockType: data.content_block?.type };
-      }
-
-      if (eventType === 'content_block_delta' || eventType === 'message_delta') {
-        if (data.type === 'content_block_delta' && data.delta?.type === 'thinking_delta') {
-          const text = data.delta.thinking ?? '';
-          // Skip if same as last text event (deduplication for thinking content)
-          if (text === this.lastTextEvent) {
-            return null;
-          }
-          this.textBuffer += text;
-          this.lastTextEvent = text;
-          return { type: 'text', data: text };
-        }
-        if (data.type === 'content_block_delta' && data.delta?.type === 'text_delta') {
-          const text = data.delta.text ?? '';
-          // Skip if same as last text event (deduplication)
-          if (text === this.lastTextEvent) {
-            return null;
-          }
-          this.textBuffer += text;
-          this.lastTextEvent = text;
-          return { type: 'text', data: text };
-        }
-        if (data.type === 'message_delta' && data.delta?.type === 'text_delta') {
-          const text = data.delta.text ?? '';
-          // Skip if same as last text event (deduplication)
-          if (text === this.lastTextEvent) {
-            return null;
-          }
-          this.textBuffer += text;
-          this.lastTextEvent = text;
-          return { type: 'text', data: text };
-        }
-        if (data.type === 'content_block_delta' && data.delta?.type === 'input_json_delta') {
-          const partialArg = data.delta.partial_json ?? '';
-          const lastToolId = Array.from(this.pendingToolCalls.keys()).pop();
-          if (lastToolId && this.pendingToolCalls.has(lastToolId)) {
-            this.pendingToolCalls.get(lastToolId)!.arguments += partialArg;
-          }
-        }
-      }
-
-      if (eventType === 'content_block_stop' || eventType === 'message_stop') {
-        return { type: 'done' };
-      }
-
-      if (eventType === 'message' || eventType === 'ping') {
-        // Capture usage data from message events (Anthropic API sends this at the end)
-        if (data.message?.usage) {
-          return { type: 'done', usage: data.message.usage };
-        }
-        return null;
-      }
-
-      if (data.type === 'tool_call' || data.type === 'function_call') {
-        const toolId = data.id ?? `call_${Date.now()}`;
-        const toolName = data.name ?? data.function?.name ?? 'unknown';
-
-        if (!this.pendingToolCalls.has(toolId)) {
-          this.pendingToolCalls.set(toolId, {
-            name: toolName,
-            arguments: data.input
-              ? (typeof data.input === 'string' ? data.input : JSON.stringify(data.input))
-              : data.function?.arguments ?? '',
-          });
-        }
-
-        return {
-          type: 'tool_call',
-          toolEvent: {
-            type: 'tool_call',
-            id: toolId,
-            name: toolName,
-          },
-        };
-      }
-
-      if (data.choices) {
-        for (const choice of data.choices) {
-          if (choice.delta?.tool_calls) {
-            for (const tc of choice.delta.tool_calls) {
-              const toolId = tc.index?.toString() ?? `call_${Date.now()}`;
-              const func = tc.function;
-              if (func) {
-                if (!this.pendingToolCalls.has(toolId)) {
-                  this.pendingToolCalls.set(toolId, {
-                    name: func.name ?? 'unknown',
-                    arguments: func.arguments ?? '',
-                  });
-                } else {
-                  const existing = this.pendingToolCalls.get(toolId)!;
-                  existing.arguments += func.arguments ?? '';
-                  if (func.name) existing.name = func.name;
-                }
-              }
-            }
-          }
-
-          if (choice.delta?.content) {
-            const text = choice.delta.content;
-            // Skip if same as last text event (deduplication)
-            if (text === this.lastTextEvent) {
-              return null;
-            }
-            this.textBuffer += text;
-            this.lastTextEvent = text;
-            return { type: 'text', data: text };
-          }
-
-          if (choice.finish_reason === 'tool_calls') {
-            const completedTools: SSEToolEvent[] = [];
-            for (const [id, tc] of this.pendingToolCalls) {
-              completedTools.push({
-                type: 'tool_complete',
-                id,
-                name: tc.name,
-                arguments: tc.arguments,
-              });
-            }
-            this.pendingToolCalls.clear();
-
-            if (completedTools.length > 0) {
-              return {
-                type: 'tool_complete',
-                toolEvent: completedTools[0],
-              };
-            }
-          }
-        }
-      }
-
-      if (data.type === 'tool_use') {
-        const toolEvent: SSEToolEvent = {
-          type: 'tool_complete',
-          id: data.id ?? `tool_${Date.now()}`,
-          name: data.name ?? 'unknown',
-          arguments: data.input ? JSON.stringify(data.input) : undefined,
-        };
-        if (data.input?.path) {
-          toolEvent.path = data.input.path;
-        }
-
-        return { type: 'tool_complete', toolEvent };
-      }
-
-      return { type: 'unknown' };
+      const parsed = JSON.parse(data);
+      this.processEventData(type, parsed);
     } catch {
-      return { type: 'unknown' };
+      // Malformed JSON — forward as-is but don't emit display event
     }
   }
 
+  // Temporary storage for events emitted during parser.feed()
+  private emittedEvents: SSEEvent[] = [];
+
+  /**
+   * Process parsed event data to extract display events for Telegram.
+   * Ported from Go's handleStreamingResponse switch statement.
+   */
+  private processEventData(eventType: string | undefined, data: Record<string, unknown>): void {
+    // Determine actual event type — eventsource-parser may give us type in data.type
+    const actualType = (data.type as string) || eventType || 'message';
+
+    // message_start — capture usage
+    if (actualType === 'message_start') {
+      const msg = data.message as { usage?: Record<string, number> } | undefined;
+      if (msg?.usage) {
+        this.usage = {
+          input_tokens: msg.usage.input_tokens ?? 0,
+          output_tokens: msg.usage.output_tokens ?? 0,
+          total_tokens: msg.usage.total_tokens ?? 0,
+        };
+      }
+    }
+
+    // message_delta — capture usage at end of stream (Anthropic format)
+    if (actualType === 'message_delta') {
+      const usage = data.usage as Record<string, number> | undefined;
+      if (usage) {
+        this.usage = {
+          input_tokens: usage.input_tokens ?? 0,
+          output_tokens: usage.output_tokens ?? 0,
+          total_tokens: usage.total_tokens ?? 0,
+        };
+      }
+    }
+
+    // content_block_start — tool_use blocks
+    if (actualType === 'content_block_start') {
+      const block = data.content_block as Record<string, unknown> | undefined;
+      if (block?.type === 'thinking') {
+        this.emittedEvents.push({ type: 'content_block', contentBlockType: 'thinking' });
+      }
+      if (block?.type === 'tool_use') {
+        const toolId = (block.id as string) || `tool_${Date.now()}`;
+        const toolName = (block.name as string) || 'unknown';
+        this.pendingToolCalls.set(toolId, { name: toolName, arguments: '' });
+      }
+    }
+
+    // content_block_delta — text_delta, thinking_delta, input_json_delta
+    if (actualType === 'content_block_delta') {
+      const delta = data.delta as Record<string, unknown> | undefined;
+      if (!delta) return;
+
+      // text_delta — actual response text, forwarded to Telegram
+      if (delta.type === 'text_delta') {
+        const text = (delta.text as string) || '';
+        if (text && text !== this.lastTextDelta) {
+          this.emittedEvents.push({ type: 'text', data: text });
+          this.lastTextDelta = text;
+        }
+      }
+
+      // thinking_delta — internal extended thinking, NOT forwarded to Telegram
+      // (only shown internally, never exposed to user)
+      if (delta.type === 'thinking_delta') {
+        const thinking = (delta.thinking as string) || '';
+        if (thinking && thinking !== this.lastTextDelta) {
+          // Track but DO NOT emit — thinking is internal model cognition
+          this.lastTextDelta = thinking;
+        }
+      }
+
+      // Ported from Go: accumulate input_json_delta for tool calls
+      // The Go code appends to toolCalls[index].Input as raw JSON bytes
+      if (delta.type === 'input_json_delta') {
+        const partialJson = (delta.partial_json as string) || '';
+        const toolId = (data.index as number) ?? -1;
+        // Find the tool at this index — pendingToolCalls uses string keys
+        const toolKey = Array.from(this.pendingToolCalls.keys())[toolId];
+        if (toolKey && this.pendingToolCalls.has(toolKey)) {
+          this.pendingToolCalls.get(toolKey)!.arguments += partialJson;
+        }
+      }
+    }
+
+    // message — capture usage (Anthropic sends this at end of non-streaming)
+    if (actualType === 'message') {
+      const msg = data.message as { usage?: Record<string, number> } | undefined;
+      if (msg?.usage) {
+        this.usage = {
+          input_tokens: msg.usage.input_tokens ?? 0,
+          output_tokens: msg.usage.output_tokens ?? 0,
+          total_tokens: msg.usage.total_tokens ?? 0,
+        };
+      }
+    }
+  }
+
+  /**
+   * Feed a raw chunk from the HTTP stream.
+   * eventsource-parser buffers internally until complete SSE lines.
+   *
+   * Returns:
+   *   events: SSE display events extracted from this chunk (text, tool calls, etc.)
+   *   cleanChunk: SSE lines to forward to client (reconstructed, ping/[DONE] stripped)
+   */
+  parse(chunk: Buffer): { events: SSEEvent[]; cleanChunk: string } {
+    // Feed raw bytes to the parser — it handles multi-chunk lines internally.
+    // The parser calls onEvent() synchronously for each complete SSE event.
+    this.parser.feed(chunk.toString('utf-8'));
+
+    // Drain the forward buffer (reconstructed SSE lines)
+    const cleanChunk = this.forwardBuffer;
+    this.forwardBuffer = '';
+
+    // Drain emitted events collected during this feed
+    const emittedEvents = this.emittedEvents;
+    this.emittedEvents = [];
+
+    return { events: emittedEvents, cleanChunk };
+  }
+
+  /**
+   * Flush — called when stream ends. Emit any pending tool_complete events.
+   */
   flush(): { events: SSEEvent[]; cleanChunk: string } {
     const events: SSEEvent[] = [];
 
+    // Emit pending tool calls as tool_complete events
     for (const [id, tc] of this.pendingToolCalls) {
       events.push({
         type: 'tool_complete',
@@ -275,9 +262,17 @@ export class SSEParser {
     }
     this.pendingToolCalls.clear();
 
+    if (this.usage && !this.doneEmitted) {
+      this.doneEmitted = true;
+      events.push({ type: 'done', usage: this.usage });
+    }
+
     return { events, cleanChunk: '' };
   }
 
+  /**
+   * Extract file path from tool arguments — same logic as Go's extractPathFromArguments.
+   */
   static extractPathFromArguments(arguments_: string, _toolName: string): string | undefined {
     try {
       const args = JSON.parse(arguments_);
@@ -289,5 +284,10 @@ export class SSEParser {
 
   static isInterceptTool(toolName: string): boolean {
     return classifyTool(toolName) === 'intercept';
+  }
+
+  /** Returns captured usage data */
+  getUsage(): { input_tokens: number; output_tokens: number; total_tokens: number } | undefined {
+    return this.usage;
   }
 }

@@ -3,6 +3,7 @@ import cors from 'cors';
 import { config } from './config/index.js';
 import { requestLogger } from './middleware/requestLogger.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { captureRawBody } from './middleware/rawBody.js';
 import openaiRouter from './routes/openai.js';
 import anthropicRouter from './routes/anthropic.js';
 import { telegramBot } from './telegram/bot.js';
@@ -17,7 +18,13 @@ const app = express();
 const startTime = Date.now();
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/middleware/logging.go
+// Capture raw request body BEFORE parsing so it can be read multiple times.
+// The raw bytes are stored in req.rawBody for signature verification / logging.
+app.use(express.json({
+  limit: '10mb',
+  verify: captureRawBody,
+}));
 app.use(requestLogger);
 
 app.get('/health', (_req: Request, res: Response) => {

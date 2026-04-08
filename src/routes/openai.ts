@@ -6,6 +6,8 @@ import { modeManager } from '../config/mode.js';
 import { MiniMaxAPIError, TimeoutError, parseMiniMaxError } from '../middleware/errorHandler.js';
 import { SSEParser } from '../utils/sseParser.js';
 import { axiosClient } from '../utils/axiosClient.js';
+import { maybeDecompress } from '../utils/streamDecoders.js';
+import { logRequest } from '../services/sessionStore.js';
 import axios from 'axios';
 import {
   startStatus,
@@ -175,12 +177,16 @@ async function handleStreamingWithApproval(
   } catch {
   }
 
+  // PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/model/models.go
+  // Pass full tool arguments for rich Telegram notifications.
+  // fullArguments stores the complete JSON (not truncated to 500 chars).
   const approvalResult = await approvalService.requestApproval(
     requestId,
     firstTool.name,
     filePath,
     preview.substring(0, 500),
-    chatId
+    chatId,
+    firstTool.arguments // full tool input JSON for detailed review
   );
 
   if (!approvalResult.approved) {
@@ -262,10 +268,26 @@ async function forwardToMiniMax(
       startStatus(chatId, existingMessageId);
     }
 
-    const streamData = response.data as Readable;
+    // PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/service/anthropic.go
+    // Handle gzip decompression BEFORE SSE parsing to avoid garbled bytes.
+    // If Content-Encoding is gzip, decompress the stream first.
+    const contentEncoding = response.headers['content-encoding'] as string | undefined;
+    let streamData = response.data as Readable;
+    if (contentEncoding) {
+      streamData = maybeDecompress(streamData, contentEncoding);
+    }
+
     const sseParser = new SSEParser();
     let streamEnded = false;
     let responseEnded = false;
+    // Session tracking — ported from Go (seifghazi/claude-code-proxy) models.go RequestLog
+    const sessionId = (req.headers['x-session-id'] as string) || '';
+    const startTime = Date.now();
+    const responseHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(response.headers)) {
+      if (typeof v === 'string') responseHeaders[k] = v;
+      else if (Array.isArray(v)) responseHeaders[k] = v.join(', ');
+    }
 
     streamData.on('data', (chunk: Buffer) => {
       if (trackStatus && !streamEnded) {
@@ -317,9 +339,23 @@ async function forwardToMiniMax(
               tool: event.toolEvent.name,
             });
           }
+          if (event.type === 'done' && event.usage) {
+            setTokens(chatId, event.usage);
+          }
         }
         completeStatus(chatId, true);
       }
+      // PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/service/storage_sqlite.go
+      // Log request/response to Redis Stream after stream completes.
+      logRequest('POST', '/v1/chat/completions', req.headers as Record<string, string>, requestBody, {
+        statusCode: response.status,
+        headers: responseHeaders,
+        responseTime: Date.now() - startTime,
+        isStreaming: true,
+        completedAt: new Date().toISOString(),
+      }, { model: requestBody.model, userAgent: req.headers['user-agent'], sessionId }).catch(err => {
+        console.error('[OpenAI] Session logging error:', err);
+      });
       res.end();
     });
 
@@ -354,7 +390,14 @@ async function forwardToMiniMax(
       }
     });
   } else {
-    // Non-streaming response - still track status
+    // Non-streaming response — session logging
+    const sessionId = (req.headers['x-session-id'] as string) || '';
+    const startTime = Date.now();
+    const responseHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(response.headers)) {
+      if (typeof v === 'string') responseHeaders[k] = v;
+      else if (Array.isArray(v)) responseHeaders[k] = v.join(', ');
+    }
     if (trackStatus) {
       startStatus(chatId);
     }
@@ -362,6 +405,17 @@ async function forwardToMiniMax(
     if (trackStatus) {
       completeStatus(chatId, true);
     }
+    // PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/service/storage_sqlite.go
+    logRequest('POST', '/v1/chat/completions', req.headers as Record<string, string>, requestBody, {
+      statusCode: response.status,
+      headers: responseHeaders,
+      body: response.data,
+      responseTime: Date.now() - startTime,
+      isStreaming: false,
+      completedAt: new Date().toISOString(),
+    }, { model: requestBody.model, userAgent: req.headers['user-agent'], sessionId }).catch(err => {
+      console.error('[OpenAI] Session logging error:', err);
+    });
   }
 }
 

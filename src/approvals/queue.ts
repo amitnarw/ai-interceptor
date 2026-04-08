@@ -1,11 +1,16 @@
 import { getRedisClient } from '../config/redis.js';
 import { getFakeApprovalQueue } from './fakeQueue.js';
 
+// PORTED FROM GO (seifghazi/claude-code-proxy) — proxy/internal/model/models.go
+// Enriched to include full tool arguments (not just truncated preview).
+// The Go RequestLog stores full Body which includes tool inputs.
+// We store fullArguments so Telegram notifications show the complete command.
 export interface ApprovalJobData {
   id: string;
   toolName: string;
   filePath?: string;
-  preview: string;
+  preview: string;        // Truncated preview (first 500 chars) for quick display
+  fullArguments?: string; // Complete tool arguments JSON — for detailed review
   timestamp: number;
   chatId: number;
   status: 'pending' | 'approved' | 'rejected' | 'timeout';
