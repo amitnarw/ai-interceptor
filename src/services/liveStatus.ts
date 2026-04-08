@@ -1,10 +1,27 @@
 import { telegramBot } from '../telegram/bot.js';
 import { buildCommandKeyboard, buildApprovalPlusCommandKeyboard, ApprovalKeyboard } from '../telegram/keyboards.js';
+import { modeManager } from '../config/mode.js';
+
+// Convert standard Markdown to Telegram Markdown format
+// Telegram uses *text* for bold, not **text**
+function toTelegramMarkdown(text: string): string {
+  // First unescape any escaped characters from MiniMax
+  let result = text
+    .replace(/\\([*_`\[\]()~>#+\-=|{}.!])/g, '$1'); // undo escape
+
+  // Convert **text** to *text* (standard bold to Telegram bold)
+  result = result.replace(/\*\*(.+?)\*\*/g, '*$1*');
+
+  // Escape only square brackets that could break code blocks
+  result = result.replace(/\[([^\]]+)\]/g, '\\[$1\\]');
+  return result;
+}
 
 // Escape function to prevent Markdown parsing errors in Telegram
+// Only escape chars that Telegram's Markdown parser interprets as special formatting
+// We specifically escape only brackets which break code blocks
 export function escapeMarkdown(text: string): string {
-  const specialChars = /([_*[`~>#+\-=|{}.!\\()\[\]])/g;
-  return text.replace(specialChars, '\\$&');
+  return toTelegramMarkdown(text);
 }
 
 export type StatusPhase = 'idle' | 'thinking' | 'active' | 'awaiting_approval';
@@ -153,7 +170,26 @@ function addEventToStatus(
 function buildStatusText(status: LiveStatusState, sseText: string): string {
   const lines: string[] = [];
 
-  // Section 1: Status (always first)
+  // Mode section - always show
+  const currentMode = modeManager.getMode();
+  const modeEmoji = currentMode === 'away' ? '🔒' : '🔓';
+  const modeLabel = currentMode === 'away' ? 'Approval Mode' : 'Passthrough Mode';
+  lines.push(`*Mode* ${modeEmoji} ${modeLabel}`);
+
+  // Spacer
+  lines.push('');
+
+  // Status section with emoji indicator
+  const phaseEmoji =
+    status.phase === 'idle'
+      ? '🟡'
+      : status.phase === 'thinking'
+        ? '🟡'
+        : status.phase === 'active'
+          ? '🟢'
+          : status.phase === 'awaiting_approval'
+            ? '🟠'
+            : '🔴';
   const phaseLabel =
     status.phase === 'idle'
       ? 'Idle'
@@ -161,85 +197,72 @@ function buildStatusText(status: LiveStatusState, sseText: string): string {
         ? 'Thinking...'
         : status.phase === 'active'
           ? 'Active'
-          : 'Awaiting Approval';
-  lines.push(`[Status: ${phaseLabel}]`);
+          : status.phase === 'awaiting_approval'
+            ? 'Awaiting Approval'
+            : 'Disconnected';
+  lines.push(`*Status* ${phaseEmoji} ${phaseLabel}`);
 
-  // Section 2: Response - shows streaming text when available
-  if (status.phase === 'idle') {
-    lines.push('[Response: No active request]');
-  } else if (status.phase === 'thinking') {
-    // Thinking content is shown in Events section, SSE section shows placeholder
-    lines.push('[Response: Thinking...]');
-  } else if (sseText.length > 0) {
-    let displaySse = sseText;
-    if (displaySse.length > MAX_SSE_DISPLAY_LENGTH) {
-      displaySse = '...' + displaySse.slice(-MAX_SSE_DISPLAY_LENGTH);
+  // Spacer
+  lines.push('');
+
+  // Response section - only show when NOT thinking
+  if (status.phase !== 'thinking') {
+    if (status.phase === 'idle') {
+      lines.push('*AI Response*: No active request');
+    } else if (sseText.length > 0) {
+      let displaySse = sseText;
+      if (displaySse.length > MAX_SSE_DISPLAY_LENGTH) {
+        displaySse = '...' + displaySse.slice(-MAX_SSE_DISPLAY_LENGTH);
+      }
+      // Put label and text on same line - no extra newline
+      lines.push(`*AI Response*: ${escapeMarkdown(displaySse)}`);
+    } else {
+      lines.push('*AI Response*: ...');
     }
-    lines.push(`[Response: ${escapeMarkdown(displaySse)}]`);
-  } else {
-    lines.push('[Response: ...]');
+
+    // Usage (tokens in code block) - only show when idle/active and has tokens
+    if (status.tokens) {
+      lines.push('');
+      const input = status.tokens.input_tokens ?? 0;
+      const output = status.tokens.output_tokens ?? 0;
+      const total = status.tokens.total_tokens ?? (input + output);
+      lines.push('*API Usage*:\n```');
+      lines.push(`Total: ${total}`);
+      lines.push(`Input: ${input}`);
+      lines.push(`Output: ${output}`);
+      lines.push('```');
+    }
   }
 
-  // Section 3: Pending approval info (only when awaiting approval)
+  // Thinking indicator (no key, just animated value)
+  if (status.phase === 'thinking') {
+    lines.push('*Thinking* ⌛');
+  }
+
+  // Pending approval info (only when awaiting approval)
   if (status.pendingApproval) {
-    lines.push('---');
-    lines.push(`[Approval Required]`);
+    lines.push('*Approval Required*');
     lines.push(`Tool: ${escapeMarkdown(status.pendingApproval.toolName)}`);
     if (status.pendingApproval.filePath) {
       lines.push(`File: ${escapeMarkdown(status.pendingApproval.filePath)}`);
     }
     if (status.pendingApproval.preview) {
-      const preview = status.pendingApproval.preview.substring(0, MAX_PREVIEW_LENGTH);
-      lines.push(`Preview: ${escapeMarkdown(preview)}`);
-    }
-  }
+      // Unescape JSON and format nicely for display
+      let preview = status.pendingApproval.preview
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .substring(0, MAX_PREVIEW_LENGTH);
 
-  // Section 4: Recent events (only meaningful events - no thinking/text)
-  if (status.events.length > 0) {
-    lines.push('---');
-    lines.push('[Events]');
-    for (const event of status.events) {
-      let eventLine = '';
-      switch (event.type) {
-        case 'tool_start':
-          eventLine = `Started: ${event.tool ?? 'unknown'}`;
-          if (event.path) eventLine += ` (${escapeMarkdown(event.path)})`;
-          break;
-        case 'tool_complete':
-          eventLine = `Completed: ${event.tool ?? 'unknown'}`;
-          if (event.detail) eventLine += ` (${escapeMarkdown(event.detail)})`;
-          break;
-        case 'tool_error':
-          eventLine = `Error: ${event.tool ?? 'unknown'}`;
-          if (event.detail) eventLine += ` - ${escapeMarkdown(event.detail)}`;
-          break;
-        case 'approval_approved':
-          eventLine = `Approved: ${event.tool ?? 'unknown'}`;
-          break;
-        case 'approval_rejected':
-          eventLine = `Rejected: ${event.tool ?? 'unknown'}`;
-          break;
-        case 'approval_timeout':
-          eventLine = `Timeout: ${event.tool ?? 'unknown'}`;
-          break;
-        case 'response_complete':
-          eventLine = 'Response complete';
-          break;
-        case 'response_error':
-          eventLine = `Error: ${event.detail ?? 'unknown'}`;
-          break;
-        default:
-          continue; // Skip unknown event types
+      // Try to parse and re-format as nice JSON
+      try {
+        const parsed = JSON.parse(preview);
+        preview = JSON.stringify(parsed, null, 2);
+      } catch {
+        // Not JSON - just use unescaped text
       }
-      lines.push(eventLine);
-    }
-  }
 
-  // Section 4: Token usage (only show if available)
-  if (status.tokens) {
-    lines.push('---');
-    lines.push(`[Tokens: ${status.tokens.total_tokens} total]`);
-    lines.push(`Input: ${status.tokens.input_tokens} | Output: ${status.tokens.output_tokens}`);
+      lines.push(`Preview:\n\`\`\`\n${preview}\n\`\`\``);
+    }
   }
 
   return lines.join('\n');
@@ -317,10 +340,15 @@ function scheduleStatusUpdate(chatId: number): void {
 
     await flushStatusUpdate(chatState);
 
-    // Schedule another update if status is still active
-    // We don't check events.length because text events are not added to events array
-    // sseText might have content that needs to be flushed
-    if (chatState.status.isActive) {
+    // Only schedule another update if:
+    // 1. Status is still active
+    // 2. NOT awaiting approval (button click will trigger update)
+    // 3. There is actually pending SSE text to send (not just same text)
+    // Don't loop if nothing changed - just wait for new events
+    if (chatState.status.isActive &&
+        chatState.status.phase !== 'awaiting_approval' &&
+        chatState.sseText.length > 0 &&
+        chatState.sseText !== chatState.lastSentText) {
       scheduleStatusUpdate(chatId);
     }
   }, delay);
@@ -481,8 +509,6 @@ export function completeStatus(chatId: number, success: boolean, message?: strin
   chatState.status.isActive = false;
   // Keep messageId - we want to keep editing the same message
   chatState.lastSentText = '';
-  chatState.sseText = '';
-  chatState.lastAppendedText = '';
   chatState.flushErrorCount = 0;
   chatState.streamingActive = false;
 
@@ -491,9 +517,26 @@ export function completeStatus(chatId: number, success: boolean, message?: strin
   if (chatState.pendingStreamHasData) {
     console.log(`[LiveStatus] completeStatus: pending timeout has SSE data, skipping flush`);
     chatState.pendingStreamHasData = false;
+    // But preserve sseText so the pending timeout can send it
     return;
   }
 
+  // CRITICAL: Flush accumulated SSE text BEFORE clearing sseText
+  // The scheduled flush may not fire in time if completeStatus is called synchronously
+  // after the last SSE chunk (within the throttle delay window)
+  if (chatState.sseText.length > 0) {
+    console.log(`[LiveStatus] completeStatus: flushing ${chatState.sseText.length} chars before clear`);
+    // Temporarily set phase to 'active' so flush sends the text (not idle placeholder)
+    chatState.status.phase = 'active';
+    flushStatusUpdate(chatState);
+    chatState.status.phase = 'idle';
+    chatState.sseText = '';
+    chatState.lastAppendedText = '';
+    return;
+  }
+
+  chatState.sseText = '';
+  chatState.lastAppendedText = '';
   flushStatusUpdate(chatState);
 }
 

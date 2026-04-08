@@ -155,8 +155,11 @@ async function handleStreamingWithApproval(
 
   console.log(`[Anthropic] Detected ${interceptTools.length} intercept tool(s), requesting approval`);
 
-  if (interceptTools.length > 1) {
-    console.log('[Anthropic] Multiple intercept tools detected, rejecting request');
+  // Only reject if there are multiple DIFFERENT types of intercept tools
+  // Allow multiple calls of the same tool type (e.g., two Read calls)
+  const uniqueToolNames = new Set(interceptTools.map(t => t.name));
+  if (uniqueToolNames.size > 1) {
+    console.log('[Anthropic] Multiple different intercept tools detected, rejecting request');
     completeStatus(chatId, false);
     res.status(400).json({
       error: 'Multiple intercept tools detected. Please retry with one tool at a time.',
@@ -289,6 +292,9 @@ async function forwardToMiniMax(
           if (event.type === 'text' && event.data) {
             console.log(`[Anthropic] text event: "${event.data.substring(0, 50)}..."`);
             appendSseText(chatId, event.data);
+          } else if (event.type === 'thinking') {
+            // Thinking content - track the phase but don't add to SSE text (user doesn't need to see internal thinking)
+            addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'content_block' && event.contentBlockType === 'thinking') {
             addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'tool_complete' && event.toolEvent) {

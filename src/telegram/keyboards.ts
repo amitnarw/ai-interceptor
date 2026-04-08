@@ -7,10 +7,10 @@ export function buildApprovalKeyboard(requestId: string): ApprovalKeyboard {
   return {
     inline_keyboard: [
       [
-        { text: 'Accept', callback_data: `approve:${requestId}` },
-        { text: 'Reject', callback_data: `reject:${requestId}` },
+        { text: '✅ Accept', callback_data: `approve:${requestId}` },
+        { text: '❌ Reject', callback_data: `reject:${requestId}` },
       ],
-      [{ text: 'Custom', callback_data: `custom:${requestId}` }],
+      [{ text: '✏️ Custom', callback_data: `custom:${requestId}` }],
     ],
   };
 }
@@ -65,9 +65,9 @@ export function buildApprovalPlusCommandKeyboard(requestId: string): ApprovalKey
   return {
     inline_keyboard: [
       [
-        { text: 'Accept', callback_data: `approve:${requestId}` },
-        { text: 'Reject', callback_data: `reject:${requestId}` },
-        { text: 'Custom', callback_data: `custom:${requestId}` },
+        { text: '✅ Accept', callback_data: `approve:${requestId}` },
+        { text: '❌ Reject', callback_data: `reject:${requestId}` },
+        { text: '✏️ Custom', callback_data: `custom:${requestId}` },
       ],
       [
         { text: 'Status', callback_data: 'cmd:status' },

@@ -1,4 +1,4 @@
-import { getRedisClient } from '../config/redis.js';
+import { getRedisClient, isRedisMock } from '../config/redis.js';
 import { getFakeApprovalQueue } from './fakeQueue.js';
 
 export interface ApprovalJobData {
@@ -40,12 +40,20 @@ async function initRealQueue(): Promise<boolean> {
   try {
     const { Queue } = await import('bullmq');
     const connection = await getRedisClient();
-    
+
+    // Check if using mock Redis (ioredis-mock has known Lua issues with BullMQ)
+    if (isRedisMock()) {
+      console.log('[Queue] Using mock Redis, skipping BullMQ (has Lua issues with cmsgpack)');
+      useFakeQueue = true;
+      fakeQueue = getFakeApprovalQueue() as unknown as QueueInterface;
+      return false;
+    }
+
     const QueueConstructor = Queue as unknown as new (name: string, opts: {
       connection: unknown;
       defaultJobOptions?: { removeOnComplete?: { count?: number }; removeOnFail?: { count?: number } };
     }) => QueueInterface;
-    
+
     realQueue = new QueueConstructor('approval-requests', {
       connection,
       defaultJobOptions: {

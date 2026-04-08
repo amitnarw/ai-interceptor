@@ -355,11 +355,11 @@ async function setMyCommands(): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         commands: [
-          { command: 'start', description: 'Show welcome message' },
-          { command: 'away', description: 'Enable approval mode' },
-          { command: 'desk', description: 'Disable approval mode (passthrough)' },
-          { command: 'status', description: 'Show current status' },
-          { command: 'clear', description: 'Clear recent tool calls' },
+          { command: 'start', description: 'Show welcome message and this help' },
+          { command: 'away', description: 'Turn on approval mode — tool calls need your OK before running' },
+          { command: 'desk', description: 'Turn off approval mode — all tool calls run automatically (transparent passthrough)' },
+          { command: 'status', description: 'Show current bot status and mode' },
+          { command: 'clear', description: 'Reset the status message and clear any pending state' },
         ],
       }),
     });
@@ -481,7 +481,8 @@ function clearCustomInputState(chatId: number): void {
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
 export function escapeMarkdown(text: string): string {
-  const specialChars = /([_*[`~>#+\-=|{}.!\\()\[\]])/g;
+  // Only escape backticks and square brackets - these break Telegram's code blocks
+  const specialChars = /([`\[\]])/g;
   return text.replace(specialChars, '\\$&');
 }
 

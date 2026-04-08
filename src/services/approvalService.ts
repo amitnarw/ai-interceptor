@@ -182,7 +182,7 @@ class ApprovalService {
         status: 'pending',
       };
 
-      addApprovalJob(jobData);
+      await addApprovalJob(jobData);
 
       // Set up timeout - use configured timeout
       const timeoutMs = config.autoRejectTimeoutMs;
@@ -238,11 +238,15 @@ class ApprovalService {
    * Handle approval from Telegram callback
    */
   async handleApproval(requestId: string, action: 'approve' | 'reject' | 'custom', _customContext?: string): Promise<void> {
+    console.log(`[ApprovalService] handleApproval called: ${requestId} action=${action}`);
     const pending = this.pendingApprovals.get(requestId);
     if (!pending) {
       console.log(`[ApprovalService] No pending approval for ${requestId}`);
+      console.log(`[ApprovalService] Pending keys:`, [...this.pendingApprovals.keys()]);
       return;
     }
+
+    console.log(`[ApprovalService] Found pending approval, resolving...`);
 
     // Mark as resolved FIRST to prevent race with polling
     pending.resolved = true;
@@ -250,6 +254,7 @@ class ApprovalService {
     // Get chatId for status update
     const job = await getApprovalJob(requestId);
     const chatId = job?.chatId ?? 0;
+    console.log(`[ApprovalService] job=${JSON.stringify(job)}, chatId=${chatId}`);
 
     // Clear timeout, reminders, and polling
     clearTimeout(pending.timeout);
@@ -267,20 +272,28 @@ class ApprovalService {
 
     // Update job status
     const status = action === 'approve' ? 'approved' : 'rejected';
-    await updateApprovalStatus(requestId, status);
+    try {
+      await updateApprovalStatus(requestId, status);
+    } catch (err) {
+      // Log but don't fail - the approval itself still needs to resolve
+      console.warn(`[ApprovalService] Failed to update job status in queue: ${(err as Error).message}`);
+    }
 
     // Update live status
+    console.log(`[ApprovalService] Calling setApprovalResult(${chatId}, ${status}, ${job?.toolName})`);
     setApprovalResult(chatId, status, job?.toolName);
 
     // Log duration
     const duration = Date.now() - pending.startTime;
     console.log(`[ApprovalService] Request ${requestId} (${pending.toolName}) ${status} in ${duration}ms`);
 
-    // Resolve the pending request
+    // Resolve the pending request - THIS IS CRITICAL and must happen even if queue update fails
+    console.log(`[ApprovalService] Calling pending.resolve({ approved: ${action === 'approve'} })`);
     pending.resolve({ approved: action === 'approve' });
 
     // Remove from pending
     this.pendingApprovals.delete(requestId);
+    console.log(`[ApprovalService] handleApproval complete`);
   }
 
   /**

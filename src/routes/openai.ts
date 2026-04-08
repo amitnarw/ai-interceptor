@@ -152,8 +152,11 @@ async function handleStreamingWithApproval(
 
   console.log(`[OpenAI] Detected ${interceptTools.length} intercept tool(s), requesting approval`);
 
-  if (interceptTools.length > 1) {
-    console.log('[OpenAI] Multiple intercept tools detected, rejecting request');
+  // Only reject if there are multiple DIFFERENT types of intercept tools
+  // Allow multiple calls of the same tool type (e.g., two Read calls)
+  const uniqueToolNames = new Set(interceptTools.map(t => t.name));
+  if (uniqueToolNames.size > 1) {
+    console.log('[OpenAI] Multiple different intercept tools detected, rejecting request');
     completeStatus(chatId, false);
     res.status(400).json({
       error: 'Multiple intercept tools detected. Please retry with one tool at a time.',
@@ -227,6 +230,13 @@ async function forwardToMiniMax(
   const stream = requestBody.stream ?? false;
   const chatId = parseInt(config.telegramChatId, 10);
 
+  // For streaming requests with status tracking, add stream_options to get token usage
+  // This allows us to display input/output token counts in Telegram
+  const requestData = { ...requestBody };
+  if (stream && trackStatus) {
+    requestData.stream_options = { include_usage: true };
+  }
+
   const response = await axiosClient({
     method: 'POST',
     url: MINIMAX_OPENAI_URL,
@@ -234,7 +244,7 @@ async function forwardToMiniMax(
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${config.minimaxApiKey}`,
     },
-    data: requestBody,
+    data: requestData,
     responseType: stream ? 'stream' : 'json',
     timeout: REQUEST_TIMEOUT_MS,
   });
@@ -274,6 +284,9 @@ async function forwardToMiniMax(
         for (const event of events) {
           if (event.type === 'text' && event.data) {
             appendSseText(chatId, event.data);
+          } else if (event.type === 'thinking') {
+            // Thinking content - track the phase but don't add to SSE text (user doesn't need to see internal thinking)
+            addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'content_block' && event.contentBlockType === 'thinking') {
             addStatusEvent(chatId, { type: 'thinking' });
           } else if (event.type === 'tool_complete' && event.toolEvent) {

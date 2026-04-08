@@ -29,7 +29,7 @@ export async function getRedisClient(): Promise<RedisClient> {
   }
 
   const useMock = process.env.USE_REDIS_MOCK === 'true' ||
-    !process.env.REDIS_HOST;
+    (process.env.USE_REDIS_MOCK !== 'false' && !process.env.REDIS_HOST);
 
   if (useMock) {
     isUsingMock = true;

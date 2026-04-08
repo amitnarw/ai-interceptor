@@ -9,7 +9,7 @@ export interface SSEToolEvent {
 }
 
 export interface SSEEvent {
-  type: 'text' | 'tool_call' | 'tool_complete' | 'content_block' | 'done' | 'unknown';
+  type: 'text' | 'thinking' | 'tool_call' | 'tool_complete' | 'content_block' | 'done' | 'unknown';
   data?: string;
   toolEvent?: SSEToolEvent;
   contentBlockType?: string;
@@ -119,7 +119,7 @@ export class SSEParser {
           }
           this.textBuffer += text;
           this.lastTextEvent = text;
-          return { type: 'text', data: text };
+          return { type: 'thinking', data: text };
         }
         if (data.type === 'content_block_delta' && data.delta?.type === 'text_delta') {
           const text = data.delta.text ?? '';
@@ -150,7 +150,10 @@ export class SSEParser {
         }
       }
 
-      if (eventType === 'content_block_stop' || eventType === 'message_stop') {
+      // Only emit done for message_stop (actual end of response)
+      // content_block_stop is per-block and should NOT end the stream
+      // (thinking block stops before text block starts sending content)
+      if (eventType === 'message_stop') {
         return { type: 'done' };
       }
 
@@ -251,6 +254,12 @@ export class SSEParser {
         }
 
         return { type: 'tool_complete', toolEvent };
+      }
+
+      // Handle OpenAI streaming usage data (from stream_options: { include_usage: true })
+      // This typically comes in the final chunk without choices
+      if (data.usage && !data.choices) {
+        return { type: 'done', usage: data.usage };
       }
 
       return { type: 'unknown' };
