@@ -332,11 +332,13 @@ class ApprovalService {
       });
 
       // Ask user for modification text via force_reply
-      const message = `Enter your modification:
+      const message = `✏️ *Custom Feedback*
 
-Please describe how you'd like to modify the tool execution. The AI will incorporate your feedback.
+Please describe what you'd like to change or add.
 
-Timeout: 60 seconds`;
+Your feedback will be shown in the next AI response.
+
+_60 seconds to respond before auto-timeout_`;
 
       const forceReplyMsgId = await telegramBot.sendMessageForceReply(chatId, message);
       if (forceReplyMsgId) {
@@ -349,22 +351,54 @@ Timeout: 60 seconds`;
 
   /**
    * Handle custom input received from user
+   * Can be called either:
+   * 1. Before timeout - normal flow (force_reply matched)
+   * 2. After timeout - late message arrives (fallback triggered)
    */
   async handleCustomInput(requestId: string, customText: string): Promise<void> {
-    const customInput = this.pendingCustomInputs.get(requestId);
-    if (!customInput) {
-      console.log(`[ApprovalService] No pending custom input for ${requestId}`);
-      return;
-    }
+    let customInput = this.pendingCustomInputs.get(requestId);
 
-    // Clear timeout
-    clearTimeout(customInput.timeout);
-    this.pendingCustomInputs.delete(requestId);
+    // If pendingCustomInputs was already cleared (timeout fired), this is a LATE message
+    // Reconstruct needed state from the job queue
+    if (!customInput) {
+      console.log(`[ApprovalService] Late custom input for ${requestId}: ${customText}`);
+
+      // Check if pendingApprovals still exists - if so, timeout fired but promise wasn't resolved
+      // (we intentionally don't resolve or delete pendingApprovals in handleCustomInputTimeout
+      // to allow late messages to override the timeout)
+      const pending = this.pendingApprovals.get(requestId);
+      if (!pending) {
+        console.log(`[ApprovalService] No pending approval for ${requestId}, ignoring late message`);
+        return;
+      }
+
+      const job = await getApprovalJob(requestId);
+      if (!job) {
+        console.log(`[ApprovalService] No job found for ${requestId}, ignoring late message`);
+        return;
+      }
+
+      // Reconstruct minimal customInput for processing
+      customInput = {
+        id: requestId,
+        toolName: job.toolName,
+        chatId: job.chatId,
+        resolve: () => {},
+        timeout: null as any,
+      };
+    } else {
+      // Normal case - clear timeout and pending state
+      clearTimeout(customInput.timeout);
+      this.pendingCustomInputs.delete(requestId);
+    }
 
     console.log(`[ApprovalService] Custom input received for ${requestId}: ${customText}`);
 
     // Update job with custom context
     await updateApprovalStatus(requestId, 'approved', customText);
+
+    // Update live status - this transitions phase from 'awaiting_approval' back to 'active'
+    setApprovalResult(customInput.chatId, 'approved', customInput.toolName);
 
     // Resolve the pending request with the custom text
     customInput.resolve(customText);
@@ -384,10 +418,13 @@ Timeout: 60 seconds`;
 
   /**
    * Handle custom input timeout
+   * NOTE: We do NOT resolve the promise or delete pendingApprovals here.
+   * This allows LATE messages (user's Telegram reply arrives after timeout)
+   * to still be processed and override the timeout result.
    */
   private async handleCustomInputTimeout(
     requestId: string,
-    originalResolve: (result: { approved: boolean; customContext?: string }) => void
+    _originalResolve: (result: { approved: boolean; customContext?: string }) => void
   ): Promise<void> {
     const customInput = this.pendingCustomInputs.get(requestId);
     if (!customInput) return;
@@ -396,17 +433,18 @@ Timeout: 60 seconds`;
 
     console.log(`[ApprovalService] Custom input timeout for ${requestId}`);
 
-    // Clear custom input state in bot
-    telegramBot.clearCustomInputState(customInput.chatId);
+    // DO NOT call telegramBot.clearCustomInputState here
+    // The user's message might still arrive late via getUpdates
+    // Let the fallback in bot.ts handle cleanup after the message arrives
 
-    // Update job status
+    // Update job status to 'timeout' (pendingApprovals entry remains for late override)
     await updateApprovalStatus(requestId, 'timeout');
 
-    // Update live status
+    // Update live status - shows timeout in UI
     setApprovalResult(customInput.chatId, 'timeout', customInput.toolName);
 
-    // Resolve as rejected
-    originalResolve({ approved: false });
+    // DO NOT resolve originalResolve here - late message may still arrive
+    // The pendingApprovals entry remains so handleCustomInput can override
 
     // Clear reminder timers
     const pending = this.pendingApprovals.get(requestId);
@@ -414,8 +452,8 @@ Timeout: 60 seconds`;
       pending.reminderTimers.forEach(t => clearTimeout(t));
     }
 
-    // Remove from pending approvals
-    this.pendingApprovals.delete(requestId);
+    // DO NOT delete from pendingApprovals - late message must be able to override
+    // DO NOT call originalResolve - timeout doesn't resolve the promise
   }
 
   /**
@@ -519,6 +557,20 @@ Timeout: 60 seconds`;
    */
   getPendingCustomInputCount(): number {
     return this.pendingCustomInputs.size;
+  }
+
+  /**
+   * Cancel pending custom input for a chat (e.g. when user sends a command)
+   */
+  cancelCustomInput(chatId: number): void {
+    for (const [requestId, customInput] of this.pendingCustomInputs.entries()) {
+      if (customInput.chatId === chatId) {
+        clearTimeout(customInput.timeout);
+        this.pendingCustomInputs.delete(requestId);
+        console.log(`[ApprovalService] Cancelled pending custom input for ${requestId}`);
+        break;
+      }
+    }
   }
 }
 

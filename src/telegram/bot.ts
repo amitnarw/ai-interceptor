@@ -192,23 +192,65 @@ async function processUpdate(update: TelegramUpdate): Promise<void> {
     if (update.message) {
       const { chat, text, reply_to_message_id, message_id } = update.message;
 
+      // Debug: log ALL messages with reply_to_message_id
+      if (reply_to_message_id !== undefined) {
+        const forceReplyMsgId = customInputMessageId.get(chat.id);
+        console.log(`[Telegram] Message with reply_to_message_id=${reply_to_message_id}, forceReplyMsgId=${forceReplyMsgId}, pendingRequestId=${pendingCustomInputChat.get(chat.id)}, text="${text?.substring(0, 50)}"`);
+      }
+
       // Handle force_reply responses (custom input)
       if (text && reply_to_message_id !== undefined) {
         const forceReplyMsgId = customInputMessageId.get(chat.id);
+        console.log(`[Telegram] Checking force_reply: reply_to_message_id=${reply_to_message_id}, forceReplyMsgId=${forceReplyMsgId}, match=${forceReplyMsgId === reply_to_message_id}`);
         if (forceReplyMsgId && reply_to_message_id === forceReplyMsgId) {
           const requestId = pendingCustomInputChat.get(chat.id);
+          console.log(`[Telegram] Force reply MATCH! requestId=${requestId}`);
           if (requestId) {
             console.log(`[Telegram] Custom input received for ${requestId}: ${text}`);
+            // Delete the force_reply prompt message first
+            await deleteMessage(chat.id, reply_to_message_id);
             await approvalService.handleCustomInput(requestId, text);
             pendingCustomInputChat.delete(chat.id);
             customInputMessageId.delete(chat.id);
             return;
           }
+        } else {
+          console.log(`[Telegram] Force reply NO MATCH: stored=${forceReplyMsgId}, received=${reply_to_message_id}`);
         }
       }
 
+      // Fallback: if user sends a message without reply_to_message_id but we have a pending custom input,
+      // treat it as the custom input (in case Telegram didn't set the reply context properly)
+      if (text && pendingCustomInputChat.has(chat.id)) {
+        const requestId = pendingCustomInputChat.get(chat.id);
+        if (requestId) {
+          console.log(`[Telegram] No reply_to_message_id but has pending custom input: ${requestId}, treating as custom input`);
+          // Delete the force_reply prompt message if we have it stored
+          const forceReplyMsgId = customInputMessageId.get(chat.id);
+          if (forceReplyMsgId) {
+            await deleteMessage(chat.id, forceReplyMsgId);
+          }
+          console.log(`[Telegram] Custom input received for ${requestId}: ${text}`);
+          await approvalService.handleCustomInput(requestId, text);
+          pendingCustomInputChat.delete(chat.id);
+          customInputMessageId.delete(chat.id);
+          return;
+        }
+      }
+
+      // Debug: log ALL incoming messages to see what's arriving
+      console.log(`[Telegram] Incoming message: msgId=${message_id}, chatId=${chat.id}, text="${text?.substring(0, 30)}", reply_to=${reply_to_message_id}, hasPendingCustom=${pendingCustomInputChat.has(chat.id)}, pendingMsgId=${customInputMessageId.get(chat.id)}`);
+
       // Handle text commands (e.g. /start, /status, etc.)
       if (text && text.startsWith('/')) {
+        // If custom input is pending, cancel it first
+        if (pendingCustomInputChat.has(chat.id)) {
+          console.log(`[Telegram] Cancelling pending custom input due to command`);
+          pendingCustomInputChat.delete(chat.id);
+          customInputMessageId.delete(chat.id);
+          // Also clear in approvalService
+          approvalService.cancelCustomInput(chat.id);
+        }
         console.log(`[Telegram] Command message: ${text}`);
         await handleCommand(text, chat.id, message_id);
         return;
@@ -387,6 +429,7 @@ async function sendMessageForceReply(chatId: number, text: string): Promise<numb
       body,
     });
     const data = (await response.json()) as TelegramSendResponse;
+    console.log(`[Telegram] sendMessageForceReply result: ok=${data.ok}, message_id=${data.result?.message_id}, description=${data.description}`);
     if (!data.ok) {
       handleTelegramAPIError(data.description);
       return null;
@@ -467,6 +510,58 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function deleteMessage(chatId: number, messageId: number): Promise<boolean> {
+  const url = `https://api.telegram.org/bot${token}/deleteMessage`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+      }),
+    });
+    const data = (await response.json()) as { ok: boolean; description?: string };
+    if (!data.ok) {
+      console.warn(`[Telegram] deleteMessage failed: ${data.description}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error('[Telegram] deleteMessage error:', error);
+    return false;
+  }
+}
+
+async function clearBotMessages(chatId: number): Promise<void> {
+  // Get the chat history to find messages sent by the bot
+  const url = `https://api.telegram.org/bot${token}/getChatHistory?chat_id=${chatId}&limit=100`;
+  try {
+    const response = await fetch(url);
+    const data = (await response.json()) as { ok: boolean; result?: { message_id: number; from?: { id: number } }[] };
+
+    if (!data.ok || !data.result) {
+      console.warn('[Telegram] getChatHistory failed');
+      return;
+    }
+
+    // Delete all messages sent by this bot (our bot_id)
+    const botId = parseInt(token.split(':')[0], 10);
+    const messagesToDelete = data.result.filter(
+      msg => msg.from && msg.from.id === botId
+    );
+
+    console.log(`[Telegram] Found ${messagesToDelete.length} bot messages to delete`);
+
+    for (const msg of messagesToDelete) {
+      await deleteMessage(chatId, msg.message_id);
+      await sleep(100); // Rate limit protection
+    }
+  } catch (error) {
+    console.error('[Telegram] clearBotMessages error:', error);
+  }
+}
+
 // ─── Accessors ───────────────────────────────────────────────────────────────
 
 function setCustomInputMessageId(chatId: number, messageId: number): void {
@@ -494,6 +589,8 @@ export const telegramBot = {
   editMessage,
   editMessageReplyMarkup,
   sendMessageForceReply,
+  deleteMessage,
+  clearBotMessages,
   setCustomInputMessageId,
   clearCustomInputState,
   escapeMarkdown,

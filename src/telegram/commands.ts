@@ -3,6 +3,7 @@ import { config } from '../config/index.js';
 import { approvalService } from '../services/approvalService.js';
 import { buildCommandKeyboard } from './keyboards.js';
 import { clearStatus, sendStatusMessage } from '../services/liveStatus.js';
+import { telegramBot } from './bot.js';
 
 const LAST_TOOL_CALLS_MAX = 5;
 
@@ -89,6 +90,7 @@ export async function handleCommand(
     case '/clear':
       clearToolCalls();
       clearStatus(chatId);
+      await telegramBot.clearBotMessages(chatId);
       await editPinnedMessage(chatId, 'Cleared recent tool call history.');
       break;
 
@@ -106,6 +108,9 @@ export async function handleCommand(
 }
 
 async function sendStartMessage(chatId: number): Promise<void> {
+  // Clear all previous bot messages first
+  await telegramBot.clearBotMessages(chatId);
+
   const mode = modeManager.getMode();
   const modeLabel = mode === 'away' ? 'AWAY' : 'DESK';
   const modeDesc = mode === 'away'
