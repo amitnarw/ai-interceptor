@@ -1,10 +1,10 @@
-# CLAUDE.md — AI Proxy Telegram Interceptor
+# CLAUDE.md — agentwatch
 
 ## Project Overview
 
-This is a local HTTP proxy server that intercepts AI tool-calling requests and lets users approve/reject them via Telegram. It sits between an AI coding assistant (Cursor, Windsurf, etc.) and the MiniMax AI backend.
+`agentwatch` lets you monitor and approve AI agent actions (file writes, shell commands, file reads, MCP calls) from Telegram — with a local web UI and Android app on the roadmap. It works via **native hooks** for Claude Code, Cursor, and OpenCode, so it works with any subscription tier (Pro/Max/Free) — no base URL changes required. It is installed per-project.
 
-**Mode**: `DESK` (transparent passthrough) or `AWAY` (intercept tools for approval).
+The project evolved from `ai-interceptor` (a MiniMax HTTP proxy). That proxy architecture is deprecated; `agentwatch` is hooks-first. This repo is a scratch/source repo — the primary work happens in the sibling `D:\amit\agentwatch` repo.
 
 ## Architecture Rules
 
@@ -25,7 +25,6 @@ let token = '';
 async function sendMessage(...) { ... }
 export const telegramBot = { sendMessage, start, stop };
 ```
-
 State lives in module-level variables (`Map`s for indexed state, plain variables for scalars).
 
 ### 2. No Classes in Tests
@@ -36,8 +35,8 @@ Mock dependencies by replacing module-level exports, not by instantiating classe
 ### Message Design
 - **ONE pinned message** per chat — evolves via `editMessage` as events stream in
 - The pinned message shows:
-  - Raw SSE streaming text (accumulated in `ChatState.sseText`)
-  - Status line: `[Idle]`, `[Active]`, or `[Awaiting Approval]`
+  - Streaming response text (accumulated in chat state)
+  - Status line: `Idle`, `Active`, or `Awaiting Approval`
   - Pending approval info (tool name, file path, preview)
   - Recent events log
 - **Always visible**: command keyboard at bottom
@@ -57,10 +56,10 @@ Buttons use `callback_data` — no emoji, plain text labels:
 
 ## State Management
 
-### `liveStatus.ts` — Single Evolving Telegram Message
+### `liveStatus` — Single Evolving Telegram Message
 - `startStatus(chatId)` — begins tracking, sends initial pinned message
 - `addStatusEvent(chatId, event)` — adds event, schedules throttled edit
-- `appendSseText(chatId, text)` — appends streaming text to message body
+- `appendText(chatId, text)` — appends streaming text to message body
 - `setApprovalRequired(...)` — transitions to `awaiting_approval`, shows approval keyboard
 - `setApprovalResult(...)` — transitions back to `active`
 - `completeStatus(chatId, success)` — shows final status, resets for next request
@@ -78,27 +77,11 @@ chatState.queueTimeout = setTimeout(async () => {
 }, delay);
 ```
 
-### `approvalService.ts` — Approval Workflow
-- `needsApproval(toolCalls)` — checks mode + tool classification
-- `peekForToolCalls()` — non-streaming probe to detect tools before streaming
-- `requestApproval(...)` — Promise-based, blocks until user responds or 10min timeout
+## Approval Workflow
+- `requestApproval(...)` — Promise-based, blocks until user responds or timeout
 - Custom input: `force_reply` via `sendMessageForceReply()`, matched by `reply_to_message_id`
 
-## SSE Streaming
-
-`SSEParser` in `src/utils/sseParser.ts` handles both OpenAI and Anthropic SSE formats. It:
-- Tracks pending tool calls (multi-delta accumulation)
-- Buffers text deltas
-- Strips `data: [DONE]` and `event: ping` from forwarded content
-
-In route handlers, for each SSE chunk:
-1. `sseParser.parse(chunk)` → `{ events, cleanChunk }`
-2. `appendSseText(chatId, cleanChunk)` → adds to Telegram message
-3. `addStatusEvent(chatId, event)` for each parsed event
-4. Forward `cleanChunk` to the original client
-
 ## Telegram Bot — Module Structure
-
 Functions in `bot.ts`:
 - `startBot()` / `stopBot()` — lifecycle
 - `sendMessage(chatId, text, replyMarkup?)` — fire-and-forget
@@ -117,5 +100,58 @@ Functions in `bot.ts`:
 - **Interfaces preferred over types** for object shapes
 - **`Map`** for indexed state (chatId → state), never plain objects as maps
 - **No mutation of passed objects** — clone before modify
-- **Console logging** with `[Component]` prefix, e.g. `[Telegram]`, `[LiveStatus]`, `[ApprovalService]`
-- **Error handling** — always log and continue (never crash the server)
+- **Console logging** with `[Component]` prefix, e.g. `[Telegram]`, `[LiveStatus]`, `[Approval]`
+- **Error handling** — always log and continue (never crash the daemon)
+
+## Project Structure
+```
+src/
+  bot.ts          # Telegram bot logic (start, stop, send, edit, commands)
+  liveStatus.ts   # Live status tracking (pinned message, events, approval)
+  hooks/          # Telegram hooks adapter
+    claudeCode.ts  # Claude Code native hook adapter
+    cursor.ts       # Cursor hooks.json adapter
+    openCode.ts     # OpenCode permission config adapter
+  types/          # TypeScript interfaces and types
+  utils/          # Utility functions
+  cli.ts          # CLI interface (init, start, status, install, uninstall)
+  daemon.ts       # Daemon process
+  test/           # Tests
+```
+
+## Dependencies
+
+- `typescript` >= 5.0
+- `otel-node` for tracing
+- `express` for web UI
+- `node-telegram-bot-api` for Telegram
+- `dotenv` for configuration
+- `chalk` for console output
+
+## Installation
+
+```bash
+npm install
+npm run build
+npm run test
+npm run typecheck
+```
+
+## Usage
+
+```bash
+npm run start      # Start the daemon
+npm run install    # Install hooks on connected agents
+npm run uninstall  # Remove hooks from connected agents
+```
+
+## Roadmap
+
+- [x] Basic Telegram bot with approval workflow
+- [x] Claude Code native hook adapter
+- [x] Cursor hooks.json adapter
+- [x] OpenCode permission config adapter
+- [ ] Android app (on roadmap)
+- [ ] Web UI (on roadmap)
+- [ ] CLI: init, start, status, install, uninstall
+- [ ] Better error handling and retry logic
